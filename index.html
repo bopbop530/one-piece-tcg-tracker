@@ -1,0 +1,1149 @@
+<!DOCTYPE html>
+<!--
+  OPTCG QUANT — One Piece TCG rip-or-buy analytics
+  ================================================
+  VERSION 1.0.0  ·  2026-07-25
+    - First build. Four tabs: Rip vs Buy, Set Explorer, Signals, Settings.
+    - Live English card + price data from optcgapi.com (3,485 cards, 21 sets),
+      fetched once and cached in localStorage.
+    - Rip vs Buy: per-pack odds, packs to 50/90%, and true cost to chase after
+      crediting the value of everything else opened.
+    - Variant taxonomy parses rarity out of card NAMES, because the API's
+      `rarity` field returns the base rarity — "Kuzan (Manga)" ($1,060) is
+      reported as an ordinary R.
+    - Fixed during build: Super Alt Art / Red Super Alt Art / Gold / Silver
+      were unclassified, dropping an $8,490 card into the Secret Rare slot and
+      inflating OP-13 box EV to $2,300 (now $248).
+    - Fixed during build: Premium Booster boxes are 20 packs x 10 cards, not
+      6 x 6 as first assumed.
+    - configFit() guards against pull-rate configs that do not match a set's
+      actual card pool, which is how the Extra Booster error surfaced.
+    - Box prices ship as ESTIMATES and are editable; EB-02 was corrected from
+      $130 to $500 after the model's own output flagged it as implausible.
+
+  VERSION 1.0.1  ·  2026-07-25
+    - Fixed: the 13-day history panel hit the API on EVERY render of the Rip
+      tab, so each search keystroke and each step of the friction slider fired
+      a request (~40 for one slider sweep). Results are now memoised per card,
+      concurrent renders share one in-flight promise, and a stale response can
+      no longer overwrite the panel after the user has moved on. Failed lookups
+      are not cached, so they retry. Search input debounced at 180ms.
+      Verified: 21 slider steps = 0 requests, new card = exactly 1.
+    - Card prices and EV were never affected — those come from the bulk payload
+      cached in localStorage and only refresh on boot or an explicit Refresh.
+
+  VERSION 1.0.2  ·  2026-07-25
+    - SIMPLIFIED the Rip vs Buy verdict. It now compares one thing: what you'd
+      spend on product to expect one copy, vs what the card sells for. Box price
+      is the only input; sell friction moved into a collapsed "full math" panel
+      and now defaults to 100% (you keep what you open), which matches how a
+      collector actually behaves. Chasing a specific card almost always loses on
+      this lens — that is the correct answer, not a bug.
+    - FIXED: cardKey was card_image_id, which is NOT unique (41 collisions).
+      OP07-076 is three different cards; clicking the $108 Carrot (SP) resolved
+      to a $20 parallel because the slot scan returned the first id match. Key is
+      now set_id|card_image_id|card_name — 3,484 unique of 3,485, the one
+      remaining collision being a genuine duplicate row in the source.
+      NOTE: this key format is also what any collection feature must store.
+    - FIXED: the card image stretched vertically as the verdict box grew, because
+      .cardhero is a flex row and defaulted to align-items:stretch. Now pinned to
+      flex-start at 132x184 with aspect-ratio 63/88 — real card proportions.
+    - Added ?v= cache busters to CSS/JS. BUMP THESE ON EVERY DEPLOY — GitHub
+      Pages caches hard, and a stale engine.js silently serves old logic.
+
+  VERSION 1.1.0  ·  2026-07-25   — English only + My Collection
+    - REMOVED JP/CN/KR. No free feed exists for them: Yuyutei and CardRush have
+      no public API, and every keyed alternative (tcgapi.dev, one-piece-api,
+      tcgpricelookup) needs a secret that cannot live in a public repo. A
+      manual-only region was dead weight, so the app is English-only now.
+    - Card page no longer asks what a box costs. The verdict comes from odds and
+      price alone: NOT A CHASE / RIP FOR IT / YOUR CALL / BUY THE SINGLE, keyed
+      off how many boxes it takes to expect one copy. Sell friction and the
+      cost-to-chase tables are gone. Box prices survive only in Set Explorer.
+    - Card image 132px -> 248px (~1.9x), still locked to 63/88 card proportions.
+    - NEW: My Collection. Multiple binders (Keeping / Trade-Sell), tap-to-add
+      grid filtered by value, per-row qty, condition, grader + grade, cost paid.
+      Cards you own now show on the card page as "you own N".
+    - Collection rows are keyed on set_id|card_image_id|card_name — the only
+      identifier that is unique. See the 1.0.2 note above for why.
+    - `value` and `paid` are separate fields on purpose. Overloading one for
+      both made a $3,500 graded card read as $3,500 spent. Gain is also computed
+      only over cards that HAVE a recorded cost, and the UI says "on 1 of 2
+      cards" rather than implying a portfolio-wide return.
+    - Graded prices are entered by hand — no free API carries them (checked:
+      PriceCharting, Scrydex and tcgpricelookup all need keys).
+    - NEW: Google Sheets sync, one row per card. A cell caps at 50k characters
+      (~700-900 cards), so the JSON-blob approach from prize-ledger would have
+      broken within about three boxes of logging. Rows also give per-row
+      last-write-wins, so two devices editing different cards both survive.
+      Deletes are tombstones or they resurrect from the un-synced device.
+      Backend is apps-script.gs; the /exec URL is pasted per device, never
+      committed. POST uses text/plain to dodge the CORS preflight Apps Script
+      cannot answer.
+    - "Clear all my settings" no longer touches the collection.
+
+  VERSION 1.2.0  ·  2026-07-25   — Signals calls + rip scoreboard
+    - Signals: anything last priced over 30 days ago is now refused outright,
+      dimmed and sorted last. It was ranking a 167-day-old scrape at #1 with a
+      floor 150% above market. "Tightening" fell from 124 to 96 once stale rows
+      stopped counting — about a quarter of that number was noise.
+    - NEW: action calls — MUST BUY / HOLD / TRIM / WATCH / STALE. A call needs
+      TWO facts to agree: supply (floor closing on market) AND momentum (13-day
+      trend). Supply alone flags one overpriced listing on a dead card as a buy.
+      Cards with tight supply but a flat price correctly land on WATCH.
+    - NEW: "Scan trends" batch-loads 13-day history for the rows on screen,
+      6 at a time, memoised. 61 cards in ~4 seconds.
+    - NEW: Signals scope filter — all cards / cards I own / my trade binder.
+      TRIM only ever fires on the trade binder; HOLD only on cards you own.
+    - NEW: rip scoreboard. Log a box opening (set, count, cost) and mark cards
+      as pulled or bought. Reports spent vs pulled per set. Bought singles are
+      excluded from winnings — a shopping spree is not good luck.
+    - Scoreboard shows "—" not "-100%" when you have logged a box but no pulls.
+      That is unfinished bookkeeping, not a loss.
+    - Box prices are NOT live and cannot be: optcgapi has no sealed endpoint and
+      no free API carries sealed product. They stay hand-entered estimates.
+
+  VERSION 1.3.0  ·  2026-07-25   — per-set pull rates
+    - FIXED: Treasure Rares were unpullable. TR sat at 0 per box in every
+      profile, so "Vista (TR)" ($23.50, OP-16) reported as impossible to pull
+      and contributed nothing to EV. Now 0.04/box — 1 in 600 packs.
+    - configFit gained the INVERSE check that would have caught it: a slot with
+      cards in the pool but a rate of 0 is now an error, not silence. It only
+      flagged rates >= 1 with an EMPTY pool before. The new check immediately
+      found a second instance — PRB-01 has a Leader card at a 0 rate.
+    - NEW: per-set pull rates. The editor now scopes to a profile (all sets of
+      a type) or a single set; sets with their own rates are marked ✎ and can
+      be reverted. Layering is profile default -> profile override -> set override.
+    - Why this matters: sets really do differ. OP-01..03 have no SP cards at
+      all, OP-13 swapped Manga Rares for Super Alt Arts (0 manga, 7 ultra),
+      OP-14/15 are bigger sets (C58-60 vs the usual C45), and Manga pool size
+      ranges 0-9. Base rarity structure is otherwise remarkably stable at
+      C45 UC30 R26 SR10 SEC2 across nearly every OP set.
+    - Note: slot POOL SIZE was already per-set everywhere — a card's odds are
+      rate / poolSize / packs, so OP-09's 5 Manga Rares each correctly got a
+      fifth of the odds of a set with one. Only the rate itself was shared.
+    - Per-set editor shows each slot's actual card count and greys slots the
+      set does not have.
+
+  VERSION 1.4.0  ·  2026-07-25   — UX pass
+    - Collection grid now TOGGLES. Tap adds one, tap again removes it; quantity
+      is edited only in the table. Repeated taps silently inflating a count you
+      cannot see was the wrong default on a grid of 120 images.
+    - Grid marks now distinguish "in THIS binder" (green, tap removes) from
+      "in another binder" (grey, tap still adds here). Quantities above 1 show
+      a badge on the card.
+    - Rip vs Buy card picker was a 155-row TEXT DROPDOWN in an app about card
+      art, while the collection tab had an image grid. Both are now the same
+      grid component.
+    - Contrast: --ink-3 was #64789b, measuring 4.15-4.41:1 on 10-12px labels —
+      under the WCAG AA floor of 4.5:1, and used app-wide. Now #8496b8, which
+      measures 6.59:1. All 14 audited text styles pass.
+    - Signals auto-scans trends on first visit. Calls are the whole point of
+      that tab and they needed a button press to appear, so it looked broken.
+    - Collection order fixed: binders -> add cards -> your cards -> scoreboard.
+      The scoreboard used to sit between the picker and the list it describes.
+    - Buttons min-height 38px; focus-visible outlines on all controls.
+    - Verified: no horizontal overflow at 375px.
+
+  VERSION 1.4.1  ·  2026-07-25   — cross-set search
+    - The API's set_id is the PACK YOU PULL IT FROM, not the set the card is
+      numbered for. SP and reprint chases are seeded into later sets: OP08-106
+      Nami (SP) ($868) is filed under OP-09 because that is the box it comes
+      out of. Every SP filed under OP-08 is likewise an older card
+      (OP07-109, OP03-112, OP02-013, ST02/03/04/06). PRB-01 is 315 foreign
+      cards out of 317.
+    - This grouping is CORRECT for EV — a box's pool is what you can pull from
+      it — but it made searching useless, because looking for OP08-106 inside
+      OP-08 finds nothing.
+    - Search now spans every set and labels each hit with the set you pull it
+      from; clicking a hit follows to that set so the odds run against the
+      right box. Empty search still shows just the open set.
+    - Card page shows "numbered OP08 · pulled from OP09 packs" when the two
+      disagree, and stays quiet when they match.
+
+  VERSION 1.4.3  ·  2026-07-25   — layout stability (user-reported)
+    - FIXED: layout jumped 15px sideways when switching tabs. Tabs differ in
+      height, so some scroll and some do not; the scrollbar appearing and
+      disappearing changed clientWidth 1920 <-> 1905 and slid the header 7px.
+      html now uses scrollbar-gutter:stable + overflow-y:scroll. Measured after:
+      width jump 0, header shift 0.
+    - FIXED: the card panel resized card to card. Names run to 83 characters
+      ("When Two Men Are Fighting the Last Thing I Need Is Some Half-Hearted
+      Assistance!!!!"), so a long one wrapped to three lines and dragged the
+      page with it. Title is clamped to two reserved lines (full name on hover),
+      .cardhero has a min-height matching the card image, and the provenance
+      line reserves its space so reprints do not grow the panel.
+      Measured: hero height varies 1px across 5 very different cards, was 27px.
+      Reported example was OP-14 "Buggy - OP09-051 (SP) (Gold)".
+    - main#app has a min-height so the footer stops leaping on short tabs.
+
+    WHY THIS WAS MISSED: every check up to now was computed-style or DOM based.
+    The Browser pane is not displayed in this environment, so the page never
+    composites and layout geometry reads as zeros — innerWidth 0, wrapW 28.
+    Contrast and structure audits were valid; anything positional was not, and
+    that gap was not stated. Forcing an explicit viewport with resize_window
+    makes geometry real. DO THAT BEFORE CLAIMING ANY LAYOUT IS VERIFIED.
+
+  VERSION 1.5.0  ·  2026-07-25   — rarity on the card grid
+    - Every card thumbnail now carries a rarity chip, bottom-right on the art,
+      where the real card prints it. Shown in both the Rip vs Buy chase grid
+      and the collection picker.
+    - The chip shows the PRINTED rarity, not the chase tier, because they
+      differ: "Kuzan (Manga)" is stamped R, "Buggy (SP) (Gold)" is stamped R.
+      Colour carries the treatment, text carries what is on the card, and the
+      tooltip names the tier.
+    - ★ prefix for parallels / alternate arts — real cards print a star above
+      the rarity letter, so this is the card's own convention, not decoration.
+    - There is NO official Bandai rarity colour spec; the letter is plain text.
+      What is documented is the physical treatment, so colours key to that:
+      SEC gold borders + textured foil -> gold; SR/R metallic rainbow border ->
+      holo sweep; Manga Rare monochrome manga art -> greyscale; Gold/Silver
+      variants -> gold/silver; C/UC no foil -> flat grey; PR not pack-pullable
+      -> dashed and deliberately dull.
+    - Covers all 12 tones across 3,485 cards. Verified: tile heights identical,
+      no chip clipping, hero height still stable to 1px.
+
+  VERSION 1.5.1  ·  2026-07-25
+    - Rarity chip moved OFF the artwork and into the metadata row: price on the
+      left, rarity on the right, card id beneath. Scans better than an overlay
+      and stops the chip covering art on small tiles.
+    - Grid column 96px -> 108px so the widest real case fits on one line:
+      "$3,916  ★SEC" over "OP05 · OP05-119". Verified across 144 starred cards,
+      zero wrapping.
+
+  VERSION 1.5.2  ·  2026-07-25   — rarity corrections (user-reported)
+    - Price is centred in the tile again. flex space-between had pushed it left
+      to make room for the chip; the chip is now absolutely positioned at the
+      right edge and takes no part in the flow. Measured: price 0px off centre
+      on every tile, chip inset 7px, no overlap.
+    - FIXED: SP cards showed their BASE rarity instead of SP. "Ms. All Sunday
+      (SP)" is stamped SR underneath and was reading SR. SP and TR are printed
+      designations in their own right, so they now display as SP / TR.
+    - FIXED: Manga Rares had no star. "Sakazuki (Manga)" now reads ★SR. Manga
+      Rares are an alternate-art treatment and carry the star like any other;
+      the Super Alt / Gold / Silver tier does too.
+    - Star rule is now slot-based (ALT, MANGA, ULTRA) rather than a tag list,
+      so it cannot miss a treatment the way an explicit list did.
+
+  VERSION 1.6.2  ·  2026-07-25   — DON!! cards, grid height, click to enlarge
+    - DON!! cards were missing because they live on a SEPARATE endpoint with a
+      different schema: no set_id, no card_set_id, and the set only present as
+      a trailing code inside optcg_don_name ("... - The Azure Sea's Seven
+      (OP14)"). One allSetCards fetch could never see them. 187 added,
+      normalised into the standard record shape. Total 3,485 -> 3,672.
+    - Most DON!! cards are NOT booster pulls — they ship in Double Pack Sets,
+      Tin Packs, Devil Fruits Collections, anniversary packs and tournament
+      prizes. 129 classed as booster-pullable, 58 excluded from pack EV but
+      still browsable and collectable. Gold Zoro DON!! (PRB-01) is $729.
+    - DON slot added to all three profiles: 1/box standard and extra, 2/box
+      premium (displays ship 2 foil DON!! alongside the packs), taken out of
+      the common count so the box still totals correctly.
+    - configFit "structure does not match" threshold raised from 1 to 5 cards
+      per box. One absent DON!! is a gap in the source data, not a broken
+      product structure; 72 absent uncommons (the original Extra Booster bug)
+      still trips it. Caught a real miss on the way: the Extra profile had no
+      DON rate while EB-03 has 7 DON!! cards.
+    - Chase grid is sized in JS to an exact number of whole rows (2 for the
+      chase picker, 3 for the collection picker). The old fixed 460px sliced
+      the third row in half. Measured twice per render because the first pass
+      runs before card art has sized, which reported tiles 10px taller and left
+      2.1 rows showing. Re-fits on window resize.
+    - Click (or Enter/Space) the card image on Rip vs Buy for a full-size view.
+      Escape, the × or the backdrop closes it; focus returns to the image.
+    - Two self-inflicted bugs found in testing: the lightbox image collapsed to
+      2x3px because aspect-ratio with auto width AND height gives no definite
+      size — max constraints alone fixed it; and the provenance note fired on
+      every DON!! ("numbered DON · pulled from PRB01 packs") since they carry
+      no set number.
+
+  VERSION 1.7.1  ·  2026-07-25   — DON!! fixes, rarity filter, scrollbars
+    - FIXED (user-reported): OP-16's regular alt-art DON!! was invisible. Its
+      group label is "DON!! Card (Alternate Art) - The Time of Battle" with NO
+      trailing (OP16) code, and the parser required one. Now falls back to
+      matching the set NAME. Also widened the code pattern, which only ever
+      matched OP-PR incorrectly (promos, excluded anyway).
+    - The OP-16 Gold DON!! image was not broken by us: 4 records ship
+      card_image: null from the API (OP-16 Gold, EB-03 Boa Hancock Gold, EB-03
+      Uta Gold, PRB-02 Rob Lucci Gold). They now render a hatched placeholder
+      at true card proportions instead of an invisible gap, and the placeholder
+      is not click-to-enlarge since there is nothing to enlarge.
+    - NEW: rarity filter on the chase list, with live counts for the open set
+      ("Secret Rare (2)"), plus a "Chase only" option collapsing SEC + alt art
+      + SP + manga + ultra + TR. OP-16 goes from 157 cards to 38.
+      Slots the set does not contain are hidden rather than shown as zero.
+    - Scrollbars themed app-wide: thin, track in the surface colour, pill thumb
+      that lights up on hover. Panels and grids use their own lighter track so
+      the bar does not read as a seam.
+
+  VERSION 1.7.2  ·  2026-07-25   — frozen price detection
+    - TCGplayer's market_price is a ROLLING WEIGHTED AVERAGE OF RECENT
+      COMPLETED SALES, not lifetime history and not listings. Weighted toward
+      recent sales; the exact window is proprietary. The API exposes no
+      sale-level data — probed /sales/, /history/, /month/, /alltime/, all 404.
+      The 13-day endpoint is the only temporal data there is.
+    - FOUND: for a card nobody has repriced, that endpoint replays the same
+      figure 13 times. A 392-day-old SPR returns $249.21 thirteen times over.
+      Flat and frozen are identical in the data and opposite in meaning, and
+      the old code read frozen as "price is stable".
+    - parseHistory now returns `frozen`. actionTag refuses to derive momentum
+      from it (NO TREND rather than WATCH), and the history panel explains what
+      a flat line actually means instead of drawing a straight sparkline.
+    - Note date_scraped is when the SCRAPER LOOKED, not when the price moved:
+      Boa Hancock (SP) was scraped 1 day ago and is still frozen. Sampling 40
+      fresh cards over $100 found 13% frozen — no recent sales at all, which is
+      normal for chase cards that trade rarely.
+    - Staleness concentrates at the top end: 96% of all cards are under a week
+      old, but 32 of the cards over $50 are past 180 days. Worst is Belo Betty
+      (SPR), $174.62, 392 days.
+
+  VERSION 1.8.0  ·  2026-07-25   — engineering review
+    P0 SILENT DATA LOSS: save() swallowed quota failures and every collection
+      write ignored the result. A full localStorage meant your binder vanished
+      on reload with no warning. saveCritical() now retries after dropping the
+      1.3MB card cache (safe — it refetches) and, failing that, tells you and
+      points at Sheets sync. Card-cache writes still fail quietly, correctly.
+    P0 SYNC WOULD BREAK AS THE COLLECTION GREW: the Apps Script issued ONE
+      setValues() call per updated row, and the client pushed the whole
+      collection on every save. Editing one quantity in a 200-card binder meant
+      200 sequential sheet writes — tens of seconds, eventually a timeout.
+      Server now merges in memory and writes each block in a single call
+      (2 API calls regardless of size); client sends only rows touched since
+      the last confirmed push. Measured: one edit now sends 1 row, not all.
+      "Save now" still forces a full resend or it would look broken.
+    P1 TOMBSTONES WERE FOREVER: deleted rows stayed in localStorage and the
+      sheet permanently, inflating every payload for the life of the app. Now
+      compacted at boot past 90 days. Trade-off stated plainly: a device that
+      has not synced in 3 months could resurrect a deleted card. Verified a
+      200-day tombstone is purged and a 5-day one is kept.
+    P1 NO ERROR BOUNDARY: any throw inside a render left the tab blank with
+      only a console message. renderActive() now catches, shows the error and
+      a reload button, and says the collection is unaffected. Verified.
+    PERF: buildSetIndex now exposes a pre-sorted flat `all` array; the Signals
+      tab was rebuilding that by walking every slot of all 21 sets on each
+      filter change, and can now break early on the price floor. Honest result:
+      Signals is 67ms on first visit (index build, then cached) and ~19ms
+      after, and is DOM-bound — 342 rows / 272KB of HTML, 11ms of which is
+      insertion alone. Not worth virtualising for a personal desktop app.
+      Verified row count against an independent walk: 342 = 342.
+
+  VERSION 1.9.1  ·  2026-07-25   — scan everything, cache it
+    - The 60-card scan cap is gone. Measured: one history request is ~135ms, so
+      at 6 in flight the whole $50+ list (342 rows) finishes in about 18s and
+      $20+ (540) in roughly 30s. Concurrency stays at 6 on purpose — this is
+      someone else's free API and 300 parallel sockets to save a few seconds is
+      not a trade worth making.
+    - Scanning is now stoppable: the button becomes an amber "Stop (54/181)"
+      and only the six in-flight requests finish. Table repaints every 1.5s so
+      calls appear as they resolve.
+    - History is CACHED TO DISK for 12 hours (~95KB for 300 cards). Previously
+      the cache was memory-only, so an 18-second scan was discarded on every
+      reload and paid again. Verified: after a reload the tab makes ZERO
+      requests and shows all 23 calls immediately.
+    - FOUND WHILE TESTING: 41 of 341 requests were failing every scan. DON!!
+      cards carry the literal string "DON" as their card id, so
+      /twoweeks/DON/ 404s for all 42 of them — and because failures are evicted
+      to allow retry, they were re-requested on every future sweep, forever.
+      They are now skipped with a settled non-retryable result. Requests per
+      full scan: 341 with 41 failures -> 299 with none.
+    - Counts no longer treat DON!! rows as outstanding work: "Trends loaded
+      300/300 · 42 DON!! have no history feed" instead of a total that could
+      never be reached.
+
+  VERSION 1.10.0  ·  2026-07-25   — Gold DON!! split out of the DON!! pool
+    - The "uniform within slot" weakness was previously written off as
+      unfixable. It was not, at least not here. PRB-01's DON!! pool held 27
+      Gold averaging $131.11 (max $729) alongside 29 plain averaging $1.98 —
+      a 66x gap, with Gold carrying 98% of the pool's value — and the model
+      drew all 56 as equally likely at $64.24 each.
+    - This is the SAME defect class as the Super Alt Art bug: a distinct
+      printing sharing a slot with ordinary cards. It is not a hidden pull
+      weight, so it does not need data nobody publishes — it needs its own slot.
+    - New DONGOLD slot for Gold/Silver DON!!. Rates: 0.2/box premium,
+      0.1/box standard and extra (estimates, tunable per set like every other
+      chase rate).
+    - Effect, and the reason it mattered: DON!! was contributing $128 of
+      PRB-01's $353 box EV — 36% of the whole box resting on that average.
+      PRB-01 now reads $255 (+82% rather than +152%), PRB-02 $221. The DON!!
+      slot contributes $4 and Gold DON!! $26, which is a defensible split
+      instead of one number averaging a $729 card with a $2 one.
+    - Genuinely unfixable remainder: within Gold DON!! (27 cards, $5 to $729)
+      the uniform assumption still applies. Splitting further would need
+      per-card weights that really are unpublished.
+
+  VERSION 1.11.0  ·  2026-07-25   — trade rate, Biggest hit fix, ≥$5 column
+    - FIXED (user-reported): Set Explorer's "Biggest hit" was showing the wrong
+      card entirely. It read conc.all[0], which is sorted by EV CONTRIBUTION
+      (copies per box x price), so a cheap card with good odds outranked the
+      actual chase. OP-09 reported $120 (Zoro-Juurou) instead of its $5,500
+      Gol.D.Roger (Manga); EB-01 $35 instead of $1,720; EB-03 $9 instead of
+      $1,351. Now reads idx.all[0], which is sorted by price, and names the
+      card underneath so it can be eyeballed.
+    - NEW column "Singles >=$5": what one copy of every card at or above $5
+      would cost, with the card count. OP-09 is $17,194 across 34 cards.
+      Sortable like the rest.
+    - NEW per-binder trade rate. Vendors do not trade 1:1, so a trade binder
+      valued at full market is a number you can never realise. Each binder
+      carries its own percentage (default 80% for trade, 100% for keeps), so a
+      shop at 60% and a friend at 90% can be separate binders. Shown on the
+      binder row, the headline stat and the card list header, always alongside
+      the market figure rather than replacing it.
+    - Slider commits on release, not on every step, or each drag notch would
+      rewrite the binder and queue a sheet push.
+    - SHEET SCHEMA CHANGED: collections gained a tradePct column. If you have
+      already deployed the Apps Script and created the sheet, delete the
+      "collections" tab and let it rebuild, or the columns will be misaligned.
+
+  VERSION 1.12.0  ·  2026-07-25   — second engineering review
+    P0 SHEET SCHEMA CORRUPTION (self-inflicted last version): rows are read and
+      written by column POSITION, and sheetFor() only wrote headers when
+      CREATING a sheet. Inserting tradePct at index 3 meant an existing sheet
+      would read createdAt as the trade rate and shift every later column by
+      one. The previous note told the user to delete the tab — a workaround,
+      not a fix. sheetFor() now compares the stored header to the current
+      column set and MIGRATES: re-keys every row by its old header names and
+      rewrites under the new one. Column order can change freely from here.
+    P1 TOMBSTONE COMPACTION WAS INERT WITH SYNC ON: the client dropped
+      tombstones past 90 days, then the next pull merged them straight back
+      because the SHEET never compacted — and the sheet is the copy that grows
+      without bound. Verified the round trip restored a 200-day tombstone.
+      Apps Script now purges on the same 90-day cutoff during upsert, while the
+      block is already in memory, so it costs nothing. Both sides must keep the
+      same constant or they will fight.
+    P1 UNBOUNDED NUMBER INPUTS: quantity and money fields took anything.
+      Entering 999999 as a quantity reported a portfolio of $1,158,108,842, and
+      a negative cost basis made the scoreboard's return meaningless. Values
+      are now clamped (qty 0-9999, money 0-1,000,000) rather than rejected, so
+      an edit is never silently dropped. Box-open logging bounded the same way.
+      Verified: -500 -> 0, 999999 -> 9999, qty 0 still deletes the row.
+
+    NOT FIXED, deliberately:
+    - No way to move a card between binders; you delete and re-add. Real gap,
+      but the fix is a UI affordance rather than a correctness issue.
+    - Click-to-enlarge exists only on the Rip vs Buy card, not the collection
+      grid. Inconsistent, low cost to live with.
+    - app.js is now ~1,600 lines. Still not worth splitting: the recurring bugs
+      have been logic and data-shape errors, which a refactor would not catch.
+      Unit tests over engine.js (pure functions, no DOM) would.
+
+  VERSION 1.13.0  ·  2026-07-25   — move cards between binders
+    - Reclassified from "missing affordance" to MUST FIX after measuring it.
+      Delete-and-re-add lost SEVEN fields: qty, condition, grader, grade,
+      value, paid, and src. Two of those matter beyond annoyance — `paid` is
+      the cost basis the scoreboard runs on, and `src` reset from "buy" to
+      "pull", which would have recounted a bought single as a pull and
+      inflated the rip scoreboard. Deciding to sell something you kept is a
+      routine action; it should not corrupt your numbers.
+    - Each row now has a "move…" picker listing the other binders. Verified all
+      seven fields survive the move intact.
+    - Moving onto an identical row in the destination MERGES rather than
+      leaving two rows of the same card: quantities sum, and a cost basis is
+      kept if only one side had one. Same card in a different state (graded vs
+      raw, pulled vs bought) stays a separate row, which is correct — those are
+      different physical cards. Verified qty 2 + qty 1 -> one row of qty 3.
+
+  VERSION 1.14.0  ·  2026-07-25   — engine tests
+    - NEW tests.html: 40 tests, 10 suites, over engine.js and collection.js.
+      Open it in a browser. No build, no dependencies, no network — the same
+      constraint as the rest of the project (there is no node on this machine).
+    - Every test guards a bug that ACTUALLY HAPPENED, and is named after it.
+      Not coverage theatre: cardKey collisions (three separate id fields that
+      looked unique and were not), the variant tags that dropped an $8,490 card
+      into the Secret Rare slot, configFit only checking one direction so
+      Treasure Rares became unpullable, chaseConcentration's ordering that made
+      "Biggest hit" show $120 instead of $5,500, frozen price series reading as
+      "stable", gain computed over a partial cost basis, and pulls vs buys in
+      the scoreboard.
+    - MUTATION TESTED, because a suite that passes on the first run has proven
+      nothing. Removing 'Super Alternate Art' from the tag whitelist failed
+      exactly one test with the original symptom (got "SEC", wanted "ULTRA").
+      Reverting cardKey to card_image_id failed exactly the two collision
+      tests. Both reverted; suite green at 40/40.
+    - Watch the cache when running these: the first mutation appeared to pass
+      because ?v= on the script tags had not changed, so the browser served the
+      old data.js. Bump the ?v= in tests.html when testing a change, or you
+      will verify against stale code — the same trap that hid a bug earlier in
+      this project.
+
+  VERSION 1.15.1  ·  2026-07-25   — starter decks and promos added
+    - Only two of the API's four catalogues were ever wired up. Missing:
+      538 starter-deck cards (/api/allSTCards/) and 1,082 promos
+      (/api/allPromos/ — the DOCUMENTED /api/allPromoCards/ path 404s).
+      That covered every winner, judge, regional, championship, Treasure Cup,
+      anniversary, illustration and serial-numbered card in the game.
+      Database 3,672 -> 5,292 cards. Cache 1.27MB -> 1.89MB.
+    - They are worth having: Yamato (Serial Numbered) $4,250, Boa Hancock
+      (CS 26-27 Regionals) $3,500, Zoro (Championship 25-26 Regionals) $3,100,
+      Nami (2025 New Year Event Winner) $2,500.
+    - PROMOS NEEDED THEIR OWN NAMESPACE. Their set_id is the card's
+      ORIGINATING set ("OP09"), not the product, so merging them raw would have
+      dropped judge cards straight into OP-09's pack pool and wrecked its odds
+      and EV. 296 of the 1,082 also share a card_image_id with a booster card.
+      They now live under set_id "PROMO" with the origin preserved separately.
+      Verified: zero non-booster cards in any booster pool, and OP-16 / OP-09 /
+      PRB-01 box EV unchanged.
+    - Starter decks kept their own clean ST-01..ST-30 ids, which cannot collide.
+    - Products are split by KIND: booster drives odds, EV and signals; decks and
+      promos are browsable and collectable but never pullable. Rip vs Buy still
+      lists 21 sets; the collection picker now offers all 52, grouped as
+      Booster sets / Promos & event cards / Starter decks.
+    - Collection search now spans every product — a promo is rarely filed where
+      you would guess — capped at 200 tiles since it is a picker, not a
+      catalogue. Booster browsing also now includes excluded cards (box
+      toppers, non-booster DON!!) so a card you own is always findable.
+    - Deduped on load: four byte-identical records ship twice (two ST-25 cards,
+      a Gecko Moria). Each was sitting in its slot pool twice and skewing that
+      slot's average.
+    - Engine tests still 40/40.
+
+  VERSION 1.16.0  ·  2026-07-25   — colour filter, badge fix, locked binders
+    - NEW colour filter on the chase list, stacking with rarity rather than
+      replacing it. Each dropdown counts against the OTHER's selection, so
+      choosing Red rewrites the rarity counts (OP-16: 157 -> 30) and picking
+      Alt Art then narrows to 6. card_color is space-separated for multicolour
+      cards ("Green Red"), so matching is by inclusion — a Green/Red card
+      appears under both, which is how a player thinks about it. If the current
+      rarity does not exist in the chosen colour the filter falls back to All
+      rather than showing an empty grid. Verified 0 non-Red tiles under Red.
+    - FIXED: rarity badges overlapped the price on the collection grid. My
+      fault — the chip was absolutely positioned, so it was out of flow and the
+      centred price could not see it. Fine at the Rip tab's 149px tiles, broken
+      on the collection's 124px ones: 2 of 47 collided, worst "$31.59" touching
+      "★SEC" at 0px. .pmeta is now a 1fr/auto/1fr grid, so the price holds the
+      centre line and the chip owns the right track — tracks cannot overlap.
+      Chip also reduced 9.5px -> 8.5px. Verified: 0 overlaps, 4px minimum gap,
+      price still 0px off centre.
+    - Keeping and Trade / Sell are now PERMANENT. The keep/trade split drives
+      the trade rate, the Signals scope filter and the "you already own this"
+      check, so deleting either would leave features pointing at nothing.
+      Marked with a lock, delete button hidden, and the handler refuses even if
+      the button is reinstated. Binders you create yourself stay deletable.
+      Existing collections migrate: the oldest binder of each kind is locked.
+    - Sheet schema gained a `locked` column; the migration added in 1.12.0
+      handles it automatically, no manual step.
+
+  VERSION 1.16.1  ·  2026-07-25
+    - FIXED: the binder lock icon dropped onto its own full-width line below
+      the name instead of sitting beside it. CSS specificity, self-inflicted:
+      `.binder .bn span { display:block }` was written for the subtitle line
+      but matched ANY span inside .bn, including the lock nested in the name —
+      so it inherited display:block and rendered 248px wide, 15px lower.
+      Scoped to `.bn > span` (direct child) and gave the lock its own
+      .lockicon class. Name block back to one line (29px -> 15px).
+
+  VERSION 1.17.2  ·  2026-07-25   — third engineering review (CSS focus)
+    P0 PROMOS INVENTED RIPPING PROFIT. Adding promo and starter-deck catalogues
+      in 1.15.1 reintroduced the bought-as-pulled bug in a new shape: newItem
+      defaults src to 'pull', so a $3,499 Regionals card you BOUGHT appeared as
+      a phantom "PROMO" row in the rip scoreboard with $3,499 winnings against
+      $0 spend, inflating the return on ripping. Fixed on two layers — the
+      collection now defaults non-pullable cards to 'buy', and scoreboard()
+      takes an isBooster predicate and refuses any key that is not a booster
+      set even if the flag says otherwise. Two regression tests added (42 now).
+    CSS AUDIT — the recurring failure mode, so it got a systematic pass rather
+      than an eyeball. Found 7 selectors of the exact shape that has now bitten
+      twice: a descendant selector ending in a bare tag AND setting
+      display:block, which anything later nested inside inherits and drops onto
+      its own full-width line. Two had already fired (binder lock, rarity chip);
+      five were waiting. All scoped to direct children:
+        .brand-txt > span   .binder .bn > b   .binder .bn > span
+        .pick > img         .cardcell .nm > b .cardcell .nm > span
+        .lb-fig > img       .lb-fig figcaption > b/span
+      Verified 0 remaining, and every element still renders as intended.
+    - Removed dead .region-pick CSS — the JP/CN/KR selector went in 1.1.0 and
+      its styles outlived it by sixteen versions.
+    - nav.tabs buttons 29px -> 36px. Primary navigation deserves a real touch
+      target; the dense in-table controls stay small on purpose, since growing
+      them would break the eight-column collection table.
+    - Layout audited at 1440px and 375px across Rip / Collection / Signals:
+      no sibling overlap, no element escaping its container, no clipped text,
+      no horizontal page overflow. The new two-column rarity/colour filter row
+      stacks correctly on mobile.
+
+    CACHE-BUSTING HAZARD, worth remembering: the ?v= string identifies a URL,
+    not a moment. Bumping index.html to ?v=1.17.0 and loading the app BEFORE
+    editing collection.js cached collection.js?v=1.17.0 with pre-edit content —
+    tests.html then requested the same URL and silently got the stale file, so
+    two genuinely-passing tests reported as failures. Bump the version AFTER
+    the last edit of a round, or verify against a version string never used.
+
+  VERSION 1.18.1  ·  2026-07-25   — phone compatibility (Samsung S25 Ultra)
+    Tested at 412x915 and 480x1040 portrait (the two viewports an S25 Ultra
+    reports depending on display scaling) and 1040x480 landscape.
+    P0 THE COLLECTION TABLE WAS UNUSABLE ON A PHONE. The mobile grid rules used
+      a bare `1fr`, which carries an automatic minimum of `auto` — so the
+      eight-column table did not scroll inside its track, it BLEW THE TRACK OUT.
+      On a 412px screen that produced an 889px wrapper whose extra 507px was
+      clipped rather than scrollable, leaving Paid, Value, source and the move
+      picker permanently unreachable. Every mobile track is now minmax(0,1fr).
+    P1 TABLES SQUASHED INSTEAD OF SCROLLING. Once the track was constrained the
+      table compressed to 53px columns — visible, useless. Data tables now have
+      a min-width floor (#col-tbl 860, #sig-tbl 800, #sets-tbl 740) so they keep
+      readable columns and scroll sideways, which is correct on a narrow screen.
+      Verified: wrapper 383px, table 889px, scrolls to the last column, controls
+      usable (qty 62px, move picker 105px).
+    - Verified across all five tabs at both portrait widths: no element escapes
+      its container, no horizontal page overflow, no clipped text, and every
+      touch target is at least 32px.
+    - Landscape 1040x480: lightbox fits (394px tall image, caption visible,
+      close button reachable), card grid still shows whole rows.
+    - Every CSS and JS feature the app relies on is supported: aspect-ratio,
+      scrollbar-gutter, backdrop-filter, -webkit-line-clamp, grid minmax,
+      custom properties, background-clip, fetch, localStorage, sendBeacon.
+      Samsung Internet is Chromium, so it behaves as Chrome does here.
+    - KNOWN, not fixed: card art is 600x838 native, shown at 248px on a ~3x
+      display, so the hero image is slightly soft on a high-DPI phone. The API
+      serves no larger asset.
+
+  VERSION 1.19.1  ·  2026-07-25   — Apps Script is now tested
+    - Previously flagged as "cannot be tested without deploying". That was too
+      pessimistic and the go/no-go was wrong because of it. apps-script.gs is
+      plain JavaScript; only SpreadsheetApp, LockService and ContentService are
+      Google-specific. tests-sheet.html mocks those with an in-memory
+      spreadsheet (1-indexed ranges, getLastRow, clearContent, insertSheet) and
+      runs the REAL, UNMODIFIED script against it. 20 tests, 6 suites.
+    - Covers: push/pull round trip, null money fields staying null, lazy sheet
+      creation, last-write-wins, stale pushes not rolling back newer edits,
+      duplicate ids inside one payload, tombstone persistence and compaction,
+      the schema migration that realigns shifted columns, batched writes, and
+      malformed input (no id, empty payload, unknown action, empty sheet).
+    - MUTATION TESTED, twice.
+      Disabling the schema migration failed the realignment test with the exact
+      column shift it guards ("got id,name,kind,createdAt... wanted
+      id,name,kind,tradePct,locked,createdAt...").
+      Reverting upsert to one write per row failed FOUR tests: the batching
+      assertion (50 setValues instead of <=2) and three compaction tests, which
+      surfaced the ghost rows a per-row write leaves behind — keep1 duplicated
+      and stale t2-t5 lingering under the block. That is precisely what the
+      clearContent guard exists to prevent, now proven rather than assumed.
+    - Two initial failures were MY TEST's fault, verified before blaming code:
+      sheets are created lazily (an items-only push creates only items), and a
+      toy updatedAt of 2000 is 1970 — older than the 90-day cutoff, so the
+      tombstone was correctly swept. Both rewritten; the second became its own
+      test since the behaviour is worth pinning.
+    - STILL UNVERIFIED, and only a real deployment can settle it: Google's own
+      runtime — actual setValues semantics, execution limits, quotas, the
+      "Anyone" deployment permission, and CORS from a browser. The logic is
+      proven; the platform is not.
+
+  VERSION 1.20.0  ·  2026-07-25   — installable PWA, and no more version bumps
+    - Fair challenge from the user: as the only user, why maintain ?v= strings?
+      Mostly they should not have to. Answered by making the service worker
+      NETWORK-FIRST rather than the usual cache-first: online it always fetches
+      the current file, and the cache exists purely as an offline fallback. A
+      deploy now reaches the device on the next open with nothing to bump.
+    - FOUND WHILE PROVING THAT CLAIM: a plain fetch() inside a service worker
+      STILL consults the browser's HTTP cache, so it never touched the network
+      and network-first silently degraded to cache-first. An edit to data.js
+      was invisible. fromNetwork() now uses cache:'reload'. Verified properly:
+      two consecutive edits both appeared with ?v=1.24.0 unchanged. Had I not
+      tested the claim, the whole design would have been quietly useless.
+    - Offline fallback matches with ignoreSearch, so the shell cached as
+      "app.js" answers a request for "app.js?v=anything". Keeping a ?v= list
+      inside sw.js would have reintroduced the very chore being removed.
+    - NEW manifest.json, sw.js and icons (192, 512, maskable 512, apple-touch),
+      generated to the app's own palette. Installs to the S25 Ultra home screen
+      via Chrome → Add to Home screen, launches standalone, runs with no signal.
+    - Registration is guarded: file:// and non-localhost http:// cannot host a
+      service worker, and the app still has to work there.
+    - Verified: SW activated, shell cached, all five tabs render behind it,
+      5,292 cards intact, no console errors.
+
+  VERSION 1.22.0  ·  2026-07-25   — mobile redesign
+    MEASURED FIRST. Collection was 4.0 screens of scrolling, Rip 3.3, Settings
+    2.8. The header alone took 124px — 13% of a 915px viewport — and
+    explanatory prose another 175-288px per tab.
+    - PRIORITY INVERSION FIXED. On Collection the panel order was stats,
+      binders, GOOGLE SHEETS (483px), add cards, your cards, scoreboard. A
+      one-time setup panel sat directly above the primary task, pushing "Add
+      cards" 1.5 screens down. Sheets now lives at the very bottom, collapsed,
+      labelled "set up once". Add cards moved 1.5 -> 0.6 screens.
+    - COLLAPSIBLE PANELS. Generic mechanism: data-collapse="key" makes a panel
+      collapsible and remembers your choice; data-collapse-mobile starts it
+      closed on a phone only; data-collapse-default-closed everywhere. Your
+      explicit choice always beats the default. Controls inside a header
+      (Reset, + New) still work without toggling the panel.
+      Applied to: Google Sheets, the scoreboard, and all three Settings panels.
+    - HEADER HALVED, 124px -> 61px on mobile. The wordmark is decoration once
+      you have opened the app twice; the tab bar is the part that gets used, so
+      it takes the space. Sync chip drops to a bare status dot.
+    - Stat cards go 2-up instead of stacked: four numbers cost 463px, now ~230.
+    - Card art on the hero drops to 116px on a phone. The picker grid is the
+      browsing surface; the hero is confirmation of what you tapped.
+    - Tighter throughout: panel padding 18 -> 13, field labels 11 -> 10, notes
+      12.5 -> 11.5, wrap padding 14 -> 12.
+    RESULT at 412x915: Collection 4.0 -> 2.0 screens, Rip 3.3 -> 2.2,
+    Settings 2.8 -> 0.3. Desktop deliberately unchanged — brand still shown,
+    every panel still open, only Sheets collapsed (correct on any screen).
+
+  VERSION 1.23.0  ·  2026-07-25   — both prices shown; image audit
+    IMAGES — audited all 5,292 cards. The mapping is sound:
+      - every card has a UNIQUE image url (0 shared between cards)
+      - filenames correspond to their card: promos matched 41 by card number
+        and 903 by name words, 0 unmatchable
+      - 42 sampled urls across all four product types, 42 loaded
+      Genuine upstream errors found: 2 variant mismatches (OP03-094_p3 served
+      OP03-094_p2 art) and 8 variant cards pointing at base art (e.g. "Shiryu
+      (Full Art)" -> OP16-108.jpg). Ten cards in 5,292, all the API's data
+      rather than our mapping, and not fixable from here.
+    PRICES — there is NO last-sold field; the API exposes only market_price and
+      inventory_price. But the gap between them explains the discrepancy, and
+      it is not staleness:
+        market_price    = weighted average of recent completed sales, near mint
+        inventory_price = cheapest copy listed right now, in ANY condition
+      Measured across 5,139 cards: the listing sits BELOW market 88% of the
+      time, median 62% of it. A played copy listed at $63 against a near-mint
+      sold average of $110 is not an error, it is two different questions.
+      The card page now shows BOTH side by side, with the ratio, the supply
+      read and the scrape age underneath, plus a hover note explaining why they
+      differ. Whichever number TCGplayer is showing you, one of these matches.
+    - NOTE FOR THE SIGNALS MODEL: the supply ratio compares an any-condition
+      floor against a near-mint sold average, so it partly measures condition
+      mix rather than pure supply. Directionally sound, not precise.
+
+  VERSION 1.23.1  ·  2026-07-25   — condition data checked, earlier claim corrected
+    - NO near-mint-only price exists in this API. Verified rather than assumed:
+      ?condition=NM returns a byte-identical response (silently ignored), and
+      /conditions/, /skus/ and /listings/ all 404. The documentation never
+      mentions condition, Near Mint, SKU or played at all. The two price fields
+      are the whole surface.
+    - CORRECTED MY OWN CLAIM from 1.23.0. I described inventory_price as "the
+      cheapest copy in ANY condition" — that was an inference from a 62% median
+      and it does not survive segmentation. By price band the listing sits at:
+        under $1  48%    $5-20  87%    $100-500  85%    $500+  98%
+      The 62% was dragged down by 2,889 sub-$1 commons where a penny listing
+      sits under a 10c sold average. On the cards that matter the two track
+      closely, and above $500 the listing is ABOVE market 46% of the time.
+      Label now reads "condition unknown", which is what we can actually
+      support, rather than a definition the API never states.
+
+  VERSION 1.24.0  ·  2026-07-27   — image audit redone properly; wrong art flagged
+    RETRACTS THE 1.23.0 IMAGE AUDIT. That audit compared image URLs and found
+    them all distinct, and I reported the mapping as sound. It was the wrong
+    test. The source stores one picture per card NUMBER, so a special printing
+    gets a COPY of the plain card's picture saved under a fresh random filename.
+    Distinct URLs, identical bytes. Comparing URLs could never have caught it.
+    Prompted by OP-16 "Vista (TR)", which shows the Rare art — confirmed by
+    downloading both: 212,729 bytes each, MD5 4AD3F1DE9C6C5D66.
+
+    REDONE BY CONTENT, not by name. All 5,148 card images were HEADed for their
+    byte length; the 263 that shared a length with another were downloaded and
+    MD5'd. 36 clusters came back identical across DIFFERENT cards.
+
+    Two distinct faults, both now visible in the app:
+      - 30 cards have NO artwork. One "coming soon" graphic is served under 30
+        filenames, covering Premium Card Collection reprints, CS 2023 Finalist
+        versions, Welcome Pack, Demo Deck and several DON!!. The app now draws
+        its own "no image" placeholder rather than a picture of nothing.
+      - 55 cards wear another card's artwork. Flagged with a ⚠ corner mark in
+        the grid and a plain-language line on the card page naming the card
+        whose picture is actually shown.
+
+    NOT FIXABLE, and the app says so. Every plausible alternate filename for the
+    real Vista TR art (_p1 _p2 _tr _tr1 _t1) 404s. The correct files are not on
+    their server. Prices and odds are unaffected — this is only the picture.
+
+    A STRUCTURAL SHORTCUT WAS TRIED FIRST AND REJECTED. Flagging cards that
+    share set_id + card_image_id needs no network at all, but it was wrong both
+    ways: it missed every cross-set case (Carrot SP $109 vs the OP-08 Parallel,
+    Rebecca SP $128, Gum-Gum Giant Manga $410, Law OP10-119 SP $168, and both
+    2024 Regional Finalist pairs) and it falsely accused Air Door and Gum-Gum
+    Red Roc, whose artwork genuinely differs. Hence a generated, hash-verified
+    list rather than a rule.
+
+    WHICH ONE GETS FLAGGED. Where exactly one card in a cluster is the plain
+    printing, it keeps the art unflagged — it legitimately owns it. Where every
+    member carries a variant marker (Full Art vs Alternate Art, Pirate Foil vs
+    Reprint, Offline vs Online Finalist) there is no way to tell which is the
+    impostor, so both are flagged.
+
+    NEW FILE imgflags.js — generated, do not hand-edit. scanall.ps1 rebuilds the
+    measurement, genflags.ps1 turns it into the file. Re-run both when new sets
+    land. Keyed on image filename: unique across all 5,148, and immune to the
+    set_id rewriting normaliseDons() does, which the first cardKey-based
+    attempt was not.
+-->
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>OPTCG Quant — Rip or Buy?</title>
+
+<!-- Installable app. The service worker is NETWORK-FIRST, so an install never
+     pins you to stale code: online you always get the latest, offline you get
+     the last copy that worked. That is why the ?v= strings below no longer
+     need touching on every deploy. -->
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0c1322">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="OPTCG Quant">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+
+<link rel="stylesheet" href="styles.css?v=1.24.0">
+</head>
+<body>
+
+<header class="top">
+  <div class="top-in">
+    <div class="brand">
+      <div class="brand-mark">Q</div>
+      <div class="brand-txt">
+        <strong>OPTCG Quant</strong>
+        <span>One Piece TCG · rip or buy</span>
+      </div>
+    </div>
+
+    <nav class="tabs" id="tabs" role="tablist">
+      <button role="tab" data-tab="rip"        aria-selected="true">Rip vs Buy</button>
+      <button role="tab" data-tab="collection" aria-selected="false">My Collection</button>
+      <button role="tab" data-tab="sets"       aria-selected="false">Set Explorer</button>
+      <button role="tab" data-tab="signals"    aria-selected="false">Signals</button>
+      <button role="tab" data-tab="settings"   aria-selected="false">Settings</button>
+    </nav>
+
+    <div class="sync-chip" id="sync-chip" title="Google Sheets sync"></div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- boot / loading -->
+  <div id="boot" class="loader">
+    <div class="spin"></div>
+    <div>
+      <div id="boot-msg">Loading the One Piece card database…</div>
+      <div class="small muted" style="margin-top:6px">optcgapi.com · ~2.3 MB · cached locally after the first load</div>
+    </div>
+  </div>
+
+  <div id="boot-error" class="hidden" style="padding:40px 0">
+    <div class="panel">
+      <div class="panel-h"><h2>Could not load card data</h2></div>
+      <div class="panel-b">
+        <p id="boot-error-msg" class="muted"></p>
+        <p class="small muted">The app pulls live prices from <code>optcgapi.com</code>. If you are offline, or the
+           API is down, nothing else here can compute. Any previously cached copy will be used automatically.</p>
+        <button class="btn primary" id="retry">Try again</button>
+      </div>
+    </div>
+  </div>
+
+  <main id="app" class="hidden">
+
+    <!-- ================================================== RIP vs BUY ==== -->
+    <section class="view" data-view="rip">
+      <div class="grid g-side">
+
+        <div class="panel">
+          <div class="panel-h"><h2>Pick your chase</h2></div>
+          <div class="panel-b">
+            <label class="fld">
+              <span>Set</span>
+              <select id="rip-set"></select>
+            </label>
+            <label class="fld">
+              <span>Search card</span>
+              <input type="search" id="rip-search" placeholder="Shanks, Zoro, OP01-120…" autocomplete="off">
+            </label>
+            <div class="grid g-2" style="gap:10px">
+              <label class="fld" style="margin-bottom:13px">
+                <span>Rarity</span>
+                <select id="rip-rarity"></select>
+              </label>
+              <label class="fld" style="margin-bottom:13px">
+                <span>Colour</span>
+                <select id="rip-color"></select>
+              </label>
+            </div>
+            <div class="fld">
+              <span>Chase card <b id="rip-count" class="mono" style="color:var(--ink-3);font-weight:600"></b></span>
+              <div id="rip-grid" class="cardgrid"></div>
+            </div>
+
+          </div>
+        </div>
+
+        <div id="rip-out"><div class="panel"><div class="panel-b muted">Pick a card to run the numbers.</div></div></div>
+      </div>
+    </section>
+
+    <!-- ================================================== COLLECTION ==== -->
+    <section class="view hidden" data-view="collection">
+      <div class="grid g-4" id="col-stats" style="margin-bottom:18px"></div>
+
+      <div class="grid g-side">
+        <div>
+          <div class="panel" style="margin-bottom:18px">
+            <div class="panel-h">
+              <h2>Binders</h2>
+              <button class="btn ghost small" id="col-new" style="margin-left:auto">+ New</button>
+            </div>
+            <div class="panel-b" id="col-list"></div>
+          </div>
+        </div>
+
+        <div>
+          <div class="panel" style="margin-bottom:18px">
+            <div class="panel-h"><h2>Add cards</h2>
+              <span class="small muted" style="margin-left:auto" id="add-target"></span></div>
+            <div class="panel-b">
+              <div class="grid g-2">
+                <label class="fld"><span>Set</span><select id="add-set"></select></label>
+                <label class="fld"><span>Minimum value — hides bulk you would never sell</span>
+                  <select id="add-min">
+                    <option value="0">Everything</option>
+                    <option value="1" selected>$1+</option>
+                    <option value="3">$3+</option>
+                    <option value="10">$10+</option>
+                  </select></label>
+              </div>
+              <label class="fld"><span>Search</span>
+                <input type="search" id="add-search" placeholder="Shanks, OP01-120…" autocomplete="off"></label>
+              <div class="note small" style="margin-bottom:12px">
+                Tap a card to add it. Base rares median <b>$0.22</b> and commons <b>$0.07</b>,
+                so the $1 filter drops ~80% of the cards while keeping ~85% of the value.
+              </div>
+              <div id="add-grid" class="cardgrid"></div>
+            </div>
+          </div>
+
+          <div class="panel" style="margin-bottom:18px">
+            <div class="panel-h"><h2 id="col-title">Cards</h2>
+              <span class="small muted" style="margin-left:auto" id="col-sub"></span></div>
+            <div class="tbl-scroll">
+              <table class="tbl" id="col-tbl">
+                <thead><tr>
+                  <th>Card</th><th>Set</th><th>State</th>
+                  <th class="num">Qty</th><th class="num">Each</th><th class="num">Paid ea.</th>
+                  <th class="num">Value</th><th></th>
+                </tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- Occasional, and tall. Collapsed on a phone by default. -->
+      <div class="panel" data-collapse="score" data-collapse-mobile style="margin-top:18px">
+        <div class="panel-h"><h2>Has ripping paid?</h2>
+          <span class="small muted" style="margin-left:auto" id="score-sub"></span></div>
+        <div class="panel-b">
+          <div class="grid g-4" style="gap:10px;align-items:end;margin-bottom:12px">
+            <label class="fld" style="margin:0"><span>Set opened</span><select id="op-set"></select></label>
+            <label class="fld" style="margin:0"><span>Boxes</span>
+              <input type="number" id="op-boxes" min="1" step="1" value="1"></label>
+            <label class="fld" style="margin:0"><span>Total paid</span>
+              <input type="number" id="op-cost" min="0" step="1" placeholder="150"></label>
+            <button class="btn primary" id="op-add">Log opening</button>
+          </div>
+          <div id="score-body"></div>
+        </div>
+      </div>
+
+      <!-- One-time setup, so it lives at the very bottom and starts closed.
+           It previously sat above "Add cards", pushing the primary task 1.5
+           screens down the page on a phone. -->
+      <div class="panel" data-collapse="sheets" data-collapse-default-closed style="margin-top:18px">
+        <div class="panel-h"><h2>Google Sheets</h2>
+          <span class="small muted" style="margin-left:auto">set up once</span></div>
+        <div class="panel-b" id="sync-panel"></div>
+      </div>
+    </section>
+
+    <!-- ================================================ SET EXPLORER ==== -->
+    <section class="view hidden" data-view="sets">
+      <div class="panel" style="margin-bottom:18px">
+        <div class="panel-h">
+          <h2>Every set, ranked</h2>
+          <span class="small muted" style="margin-left:auto" id="sets-sub"></span>
+        </div>
+        <div class="tbl-scroll">
+          <table class="tbl" id="sets-tbl">
+            <thead>
+              <tr>
+                <th class="sortable" data-sort="name">Set</th>
+                <th class="sortable num" data-sort="box">Box price</th>
+                <th class="sortable num" data-sort="evBox">EV / box</th>
+                <th class="sortable num" data-sort="evPack">EV / pack</th>
+                <th class="sortable num" data-sort="roi">Return</th>
+                <th class="sortable num" data-sort="conc">Top-5 share</th>
+                <th class="sortable num" data-sort="best">Biggest hit</th>
+                <th class="sortable num" data-sort="over5">Singles &ge;$5</th>
+                <th class="num">Cards</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="note warn small" style="margin-bottom:14px">
+        Rows marked <span class="tag est">?</span> are Extra and Premium Boosters, whose per-pack rarity
+        structure Bandai has never published. Their box and pack counts are confirmed; the rarity split is
+        inferred from each set's own card pool, so read those returns as rough.
+      </div>
+      <div class="note warn small">
+        <strong>Return</strong> is expected sealed value against box price, before you sell anything.
+        It is an average across infinite boxes — not what your box will do. A set can show +30%
+        and still brick nine boxes out of ten if <strong>Top-5 share</strong> is high.
+      </div>
+    </section>
+
+    <!-- ===================================================== SIGNALS ==== -->
+    <section class="view hidden" data-view="signals">
+      <div class="grid g-4" id="sig-stats" style="margin-bottom:18px"></div>
+      <div class="panel">
+        <div class="panel-h">
+          <h2>Supply signal — cheap copies drying up</h2>
+          <select id="sig-scope" style="width:auto;margin-left:auto">
+            <option value="all">All cards</option>
+            <option value="owned">Cards I own</option>
+            <option value="trade">My trade binder</option>
+          </select>
+          <select id="sig-set" style="width:auto"></select>
+          <select id="sig-min" style="width:auto">
+            <option value="20">$20+</option>
+            <option value="50" selected>$50+</option>
+            <option value="100">$100+</option>
+            <option value="250">$250+</option>
+          </select>
+          <button class="btn primary" id="sig-scan">Scan trends</button>
+        </div>
+        <div class="panel-b" style="padding-bottom:0">
+          <div class="note small" id="sig-legend"></div>
+        </div>
+        <div class="tbl-scroll">
+          <table class="tbl" id="sig-tbl">
+            <thead>
+              <tr>
+                <th>Card</th>
+                <th>Set</th>
+                <th class="sortable num" data-sort="market">Market</th>
+                <th class="sortable num" data-sort="inv">Floor</th>
+                <th class="sortable num" data-sort="ratio">Floor / market</th>
+                <th class="sortable num" data-sort="change">13-day</th>
+                <th class="sortable num" data-sort="score">Supply</th>
+                <th class="sortable num" data-sort="rank">Call</th>
+                <th class="sortable num" data-sort="age">Last seen</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="note small" style="margin-top:18px">
+        There is no free eBay listing-count or PSA population feed, so this is not TCGQuant's exact input.
+        What every card does have is a <strong>lowest listing</strong> and a <strong>recent sold average</strong>.
+        When the floor climbs toward the market price, the cheap copies are gone — that is supply tightening,
+        measured rather than guessed. A floor <em>above</em> market is not automatically bullish either: market
+        price is a lagging sold-average, so that gap can mean a card is running or simply that one overpriced
+        listing is sitting on a card nobody has traded. That is why a call needs the 13-day trend to confirm it,
+        and why anything last priced over 30 days ago is refused rather than ranked. Click any row for its history.
+      </div>
+    </section>
+
+    <!-- ==================================================== SETTINGS ==== -->
+    <section class="view hidden" data-view="settings">
+      <div class="grid g-2">
+        <div class="panel" data-collapse="boxprices" data-collapse-mobile>
+          <div class="panel-h">
+            <h2>Box prices</h2>
+            <button class="btn ghost small" id="reset-boxes" style="margin-left:auto">Reset</button>
+          </div>
+          <div class="panel-b">
+            <div class="note warn small" style="margin-bottom:14px">
+              No free API exists for sealed product, so these ship as <strong>estimates</strong>.
+              Anything you edit turns gold and is saved to this browser. Put in what you actually pay.
+            </div>
+            <div id="box-editor"></div>
+          </div>
+        </div>
+
+        <div>
+          <div class="panel" data-collapse="pullrates" data-collapse-mobile style="margin-bottom:18px">
+            <div class="panel-h">
+              <h2>Pull rates</h2>
+              <select id="pr-profile" style="width:auto;margin-left:auto"></select>
+              <button class="btn ghost small" id="reset-rates">Reset</button>
+            </div>
+            <div class="panel-b">
+              <div class="note warn small" style="margin-bottom:14px">
+                Bandai publishes nothing. Community tables disagree with each other and most
+                do not even sum to a real box. These do. Adjust them to match what you actually pull —
+                every number in the app moves with them.<br><br>
+                Pick a <b>profile</b> to set every set of that type at once, or pick a <b>single set</b>
+                to override just that one — sets marked <b>✎</b> have their own rates. Slot
+                <em>pool sizes</em> are already per-set everywhere, so a set with 5 Manga Rares
+                gives each one a fifth of the odds without you doing anything.
+              </div>
+              <div id="rate-editor"></div>
+              <div id="rate-sum" class="small muted" style="margin-top:12px"></div>
+            </div>
+          </div>
+
+          <div class="panel" data-collapse="data" data-collapse-mobile>
+            <div class="panel-h"><h2>Data</h2></div>
+            <div class="panel-b">
+              <div id="data-info" class="small muted" style="margin-bottom:14px"></div>
+              <div style="display:flex;gap:9px;flex-wrap:wrap">
+                <button class="btn" id="refresh-data">Refresh prices</button>
+                <button class="btn ghost" id="clear-all">Clear all my settings</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </section>
+
+  </main>
+
+  <footer class="foot">
+    Card data and English market prices from
+    <a href="https://optcgapi.com/" target="_blank" rel="noopener">optcgapi.com</a>.
+    Pull rates are community estimates, not official Bandai figures — treat every number here as a model, not a promise.
+    Built for ripping, not for financial advice.
+  </footer>
+</div>
+
+<div id="modal-root"></div>
+
+<script>
+/* Register the service worker — this is what makes the app installable and
+   lets it run without a connection. Wrapped in a guard because file:// and
+   plain http:// (other than localhost) do not allow service workers, and the
+   app must keep working there. */
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function () {
+    navigator.serviceWorker.register('sw.js').catch(function (err) {
+      console.warn('[optcg-quant] service worker not registered:', err.message);
+    });
+  });
+}
+</script>
+<script src="data.js?v=1.24.0"></script>
+<script src="engine.js?v=1.24.0"></script>
+<script src="collection.js?v=1.24.0"></script>
+<script src="imgflags.js?v=1.24.0"></script>
+<script src="app.js?v=1.24.0"></script>
+</body>
+</html>
