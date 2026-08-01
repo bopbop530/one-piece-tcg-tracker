@@ -580,17 +580,20 @@
     return rows;
   }
 
+  const isBoosterSet = id => D.SETS.some(s => s.id === id);
+
   function ripCardOptions() {
     const q = S.ripSearch.trim().toLowerCase();
     const slot = S.ripRarity || 'all';
     let rows;
 
     if (!q) {
-      rows = poolOf(S.ripSet);
+      rows = browsePool(S.ripSet);
     } else {
+      // Search spans EVERY group — boosters, decks and promos alike.
       rows = [];
-      for (const s of liveSets()) {
-        for (const e of poolOf(s.id)) {
+      for (const s of browseSets()) {
+        for (const e of browsePool(s.id)) {
           if (e.card.card_name.toLowerCase().includes(q) ||
               e.card.card_set_id.toLowerCase().includes(q)) {
             rows.push(Object.assign({ fromSet: s.id }, e));
@@ -678,18 +681,26 @@
   }
 
   function renderRipControls() {
-    const sets = liveSets();
-    if (!S.ripSet || !sets.some(s => s.id === S.ripSet)) S.ripSet = defaultSetId(sets);
+    /* Every group, not just the 22 rippable boosters.
+
+       This tab is where you look a card up, and until now it could only see
+       booster sets — so starter decks, promos, judge and winner cards, event
+       packs, Dash Packs and anniversary sets were all unreachable, even though
+       the app had already loaded them. 6,798 cards were in memory and 3,600 of
+       them could not be found. */
+    const sets = browseSets();
+    if (!S.ripSet || !sets.some(s => s.id === S.ripSet)) S.ripSet = defaultSetId(liveSets());
 
     // A set TCGplayer has created but not populated is marked, so choosing it
     // and finding empty art and no numbers is an informed decision rather than
     // a bug you have to diagnose.
     $('#rip-set').innerHTML = sets.map(s =>
       `<option value="${esc(s.id)}"${s.id === S.ripSet ? ' selected' : ''}>${
-        esc(s.short)} · ${esc(s.name)}${pricedShare(s.id) < 0.5 ? ' — no data yet' : ''}</option>`
+        esc(s.short)} · ${esc(s.name)}${
+        isBoosterSet(s.id) && pricedShare(s.id) < 0.5 ? ' — no data yet' : ''}</option>`
     ).join('');
 
-    const thin = pricedShare(S.ripSet) < 0.5;
+    const thin = isBoosterSet(S.ripSet) && pricedShare(S.ripSet) < 0.5;
     const note = $('#rip-thin');
     if (note) {
       note.innerHTML = thin
@@ -717,7 +728,9 @@
            data-key="${esc(e.key)}"
            data-set="${esc(e.fromSet || S.ripSet)}"
            title="${esc(e.card.card_name)}${e.variantLabel ? ' — ' + esc(e.variantLabel) : ''}${
-             e.fromSet ? ' — pulled from ' + esc(setShort(e.fromSet)) + ' packs' : ''}${
+             e.fromSet ? (isBoosterSet(e.fromSet)
+                          ? ' — pulled from ' + esc(setShort(e.fromSet)) + ' packs'
+                          : ' — from ' + esc(setShort(e.fromSet))) : ''}${
              fl ? ' — ' + esc(artFlagText(fl)) : ''}">
         ${cardArt(e.card)}
         <div class="pmeta"><span class="pp">${E.money(e.price)}</span>${rarityChip(e.card)}</div>
@@ -861,6 +874,67 @@
     wireCollapsibles();
   }
 
+  /* The card page for anything you cannot pull from a pack.
+
+     Same layout as the odds page minus the probability block: art, rarity,
+     both prices, the supply read and a buy link. Everything you would want
+     when price-checking a promo or a starter-deck card. */
+  function renderPriceOnlyCard(out, why) {
+    const card = S.byKey[S.ripCard];
+    if (!card) { out.innerHTML = panelMsg('Pick a card.'); return; }
+
+    const sig    = E.spreadSignal(card);
+    const single = priceOf(card);
+    const owned  = ownedSummary(S.ripCard);
+    const badge  = E.rarityBadge(card);
+    const origin = card.originSet ? ' · ' + card.originSet : '';
+
+    out.innerHTML = `
+      <div class="panel" style="margin-bottom:18px">
+        <div class="panel-b">
+          <div class="cardhero">
+            ${card.card_image
+              ? `<img src="${esc(card.card_image)}" alt="${esc(card.card_name)}" loading="lazy"
+                     class="zoomable" id="hero-img" tabindex="0" role="button" title="Click to enlarge">`
+              : `<div class="noart" id="hero-img"><span>no image<br>available</span></div>`}
+            <div style="flex:1;min-width:0">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+                <span class="tag">${esc(badge.label || badge.text)}</span>
+                <span class="mono small muted">${esc(card.card_set_id || '')}</span>
+                ${owned ? `<span class="tag" style="color:var(--up);border-color:#2a6b4a">✓ you own ${owned.qty}</span>` : ''}
+              </div>
+              <h3 class="cardtitle" title="${esc(card.card_name)}">${esc(card.card_name)}</h3>
+              <div class="small muted setline">${esc(setShort(card.set_id))}${esc(origin)}</div>
+
+              <div class="grid g-2" style="gap:12px;margin:12px 0 8px">
+                ${stat('Market price', E.money(single), 'recent sold average')}
+                ${stat('Lowest listing', sig ? E.money(sig.inventory) : '—',
+                       sig ? 'cheapest listed now' : 'no listing data')}
+              </div>
+              ${sig ? `<div class="small muted" style="margin-bottom:14px">
+                Listing is <b>${E.pct(sig.ratio, 0)}</b> of market — <b>${esc(sig.state)}</b> supply.</div>` : ''}
+              ${card.buy_url ? `<a class="btn primary" href="${esc(card.buy_url)}" target="_blank"
+                   rel="noopener nofollow" style="display:inline-block">View on TCGplayer</a>` : ''}
+            </div>
+          </div>
+
+          <div class="note small" style="margin-top:16px">
+            <b>No pack odds for this card.</b>
+            ${esc(why || 'It comes from a starter deck, promo, event or other sealed product rather than a booster pack, so there is nothing to calculate odds against.')}
+            Price and supply above are live.
+          </div>
+        </div>
+      </div>`;
+
+    const hero = $('#hero-img');
+    if (hero && card.card_image) {
+      hero.addEventListener('click', () => openLightbox(card));
+      hero.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openLightbox(card); }
+      });
+    }
+  }
+
   function renderRip() {
     renderRipControls();
     renderSealed();
@@ -871,11 +945,17 @@
       return;
     }
 
+    /* A promo, a deck card or a box topper has no pack odds — there is no pack.
+       That used to dead-end on "not in this set's pack pool", which is true and
+       useless: you came to look the card up, and the price is the answer. Show
+       the card and its market data, and say plainly why there are no odds. */
+    if (!isBoosterSet(S.ripSet)) { renderPriceOnlyCard(out); return; }
+
     const idx  = indexFor(S.ripSet);
     const cfg  = configFor(S.ripSet);
     const prob = E.perPackProbability(idx, cfg, S.ripCard);
 
-    if (!prob) { out.innerHTML = panelMsg('That card is not in this set&rsquo;s pack pool.'); return; }
+    if (!prob) { renderPriceOnlyCard(out, 'This card is in the set but not in its pack pool — a box topper, promo insert or similar.'); return; }
 
     const card   = prob.entry.card;
     const single = prob.entry.price;
