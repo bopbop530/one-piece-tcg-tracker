@@ -199,28 +199,44 @@ const OQ_DATA = (function () {
      `box` is an ESTIMATED sealed English booster box price in USD — these move
      constantly, so they are marked estimated until you edit them.
      -------------------------------------------------------------------------- */
+  /* The rippable booster sets.
+
+     `id` is kept from v1 on purpose even though the data source changed: it is
+     what settings, box-price overrides and the selected set are stored under,
+     so renaming it would quietly reset preferences that are already saved.
+
+     `group` is the TCGplayer groupId this set maps to on TCGCSV — the join key
+     for everything v2 fetches.
+
+     `box` is now only a FALLBACK. Real box and case prices come from the
+     sealed products in each set's own feed; this number is used when a set has
+     no sealed listing (sold out, or not yet on sale) and is what the EST tag
+     marks. */
   const SETS = [
-    { id: 'OP-01',     name: 'Romance Dawn',                   short: 'OP01', profile: 'STANDARD', box: 1150 },
-    { id: 'OP-02',     name: 'Paramount War',                  short: 'OP02', profile: 'STANDARD', box: 500 },
-    { id: 'OP-03',     name: 'Pillars of Strength',            short: 'OP03', profile: 'STANDARD', box: 350 },
-    { id: 'OP-04',     name: 'Kingdoms of Intrigue',           short: 'OP04', profile: 'STANDARD', box: 270 },
-    { id: 'OP-05',     name: 'Awakening of the New Era',       short: 'OP05', profile: 'STANDARD', box: 320 },
-    { id: 'OP-06',     name: 'Wings of the Captain',           short: 'OP06', profile: 'STANDARD', box: 260 },
-    { id: 'EB-01',     name: 'Memorial Collection',            short: 'EB01', profile: 'EXTRA',    box: 280 },
-    { id: 'OP-07',     name: '500 Years in the Future',        short: 'OP07', profile: 'STANDARD', box: 210 },
-    { id: 'OP-08',     name: 'Two Legends',                    short: 'OP08', profile: 'STANDARD', box: 230 },
-    { id: 'OP-09',     name: 'Emperors in the New World',      short: 'OP09', profile: 'STANDARD', box: 175 },
-    { id: 'OP-10',     name: 'Royal Blood',                    short: 'OP10', profile: 'STANDARD', box: 185 },
-    { id: 'PRB-01',    name: 'Premium Booster — The Best',     short: 'PRB01', profile: 'PREMIUM', box: 140 },
-    { id: 'OP-11',     name: 'A Fist of Divine Speed',         short: 'OP11', profile: 'STANDARD', box: 165 },
-    { id: 'EB-02',     name: 'Anime 25th Collection',          short: 'EB02', profile: 'EXTRA',    box: 500 },
-    { id: 'OP-12',     name: 'Legacy of the Master',           short: 'OP12', profile: 'STANDARD', box: 150 },
-    { id: 'PRB-02',    name: 'Premium Booster — The Best Vol.2', short: 'PRB02', profile: 'PREMIUM', box: 120 },
-    { id: 'OP-13',     name: 'Carrying On His Will',           short: 'OP13', profile: 'STANDARD', box: 150 },
-    { id: 'OP14-EB04', name: "The Azure Sea's Seven",          short: 'OP14', profile: 'STANDARD', box: 140 },
-    { id: 'EB-03',     name: 'One Piece Heroines Edition',     short: 'EB03', profile: 'EXTRA',    box: 300 },
-    { id: 'OP15-EB04', name: "Adventure on Kami's Island",     short: 'OP15', profile: 'STANDARD', box: 130 },
-    { id: 'OP-16',     name: 'The Time of Battle',             short: 'OP16', profile: 'STANDARD', box: 150 }
+    { id: 'OP-01',     group: 3188,  name: 'Romance Dawn',                   short: 'OP01', profile: 'STANDARD', box: 1150 },
+    { id: 'OP-02',     group: 17698, name: 'Paramount War',                  short: 'OP02', profile: 'STANDARD', box: 500 },
+    { id: 'OP-03',     group: 22890, name: 'Pillars of Strength',            short: 'OP03', profile: 'STANDARD', box: 350 },
+    { id: 'OP-04',     group: 23024, name: 'Kingdoms of Intrigue',           short: 'OP04', profile: 'STANDARD', box: 270 },
+    { id: 'OP-05',     group: 23213, name: 'Awakening of the New Era',       short: 'OP05', profile: 'STANDARD', box: 320 },
+    { id: 'OP-06',     group: 23272, name: 'Wings of the Captain',           short: 'OP06', profile: 'STANDARD', box: 260 },
+    { id: 'EB-01',     group: 23333, name: 'Memorial Collection',            short: 'EB01', profile: 'EXTRA',    box: 280 },
+    { id: 'OP-07',     group: 23387, name: '500 Years in the Future',        short: 'OP07', profile: 'STANDARD', box: 210 },
+    { id: 'OP-08',     group: 23462, name: 'Two Legends',                    short: 'OP08', profile: 'STANDARD', box: 230 },
+    { id: 'OP-09',     group: 23589, name: 'Emperors in the New World',      short: 'OP09', profile: 'STANDARD', box: 175 },
+    { id: 'OP-10',     group: 23766, name: 'Royal Blood',                    short: 'OP10', profile: 'STANDARD', box: 185 },
+    { id: 'PRB-01',    group: 23496, name: 'Premium Booster — The Best',     short: 'PRB01', profile: 'PREMIUM', box: 140 },
+    { id: 'OP-11',     group: 24241, name: 'A Fist of Divine Speed',         short: 'OP11', profile: 'STANDARD', box: 165 },
+    { id: 'EB-02',     group: 23834, name: 'Anime 25th Collection',          short: 'EB02', profile: 'EXTRA',    box: 500 },
+    { id: 'OP-12',     group: 24302, name: 'Legacy of the Master',           short: 'OP12', profile: 'STANDARD', box: 150 },
+    { id: 'PRB-02',    group: 24305, name: 'Premium Booster — The Best Vol.2', short: 'PRB02', profile: 'PREMIUM', box: 120 },
+    { id: 'OP-13',     group: 24303, name: 'Carrying On His Will',           short: 'OP13', profile: 'STANDARD', box: 150 },
+    { id: 'OP14-EB04', group: 24537, name: "The Azure Sea's Seven",          short: 'OP14', profile: 'STANDARD', box: 140 },
+    { id: 'EB-03',     group: 24545, name: 'One Piece Heroines Edition',     short: 'EB03', profile: 'EXTRA',    box: 300 },
+    { id: 'OP15-EB04', group: 24637, name: "Adventure on Kami's Island",     short: 'OP15', profile: 'STANDARD', box: 130 },
+    { id: 'OP-16',     group: 24664, name: 'The Time of Battle',             short: 'OP16', profile: 'STANDARD', box: 150 },
+    // New in v2. optcgapi never carried OP-17 at all — its database stops at
+    // OP-15 by their own description, and OP-16 arrived only partially.
+    { id: 'OP-17',     group: 24736, name: "The World's Strongest Warriors", short: 'OP17', profile: 'STANDARD', box: 110 }
   ];
 
   /* Everything above is sealed booster product. Starter decks and promos are
@@ -236,16 +252,10 @@ const OQ_DATA = (function () {
      filtering matches by inclusion — a Green/Red card belongs under both. */
   const COLORS = ['Red', 'Green', 'Blue', 'Purple', 'Black', 'Yellow'];
 
-  const API = {
-    base: 'https://optcgapi.com',
-    allCards: 'https://optcgapi.com/api/allSetCards/',
-    allDon:   'https://optcgapi.com/api/allDonCards/',
-    allDecks: 'https://optcgapi.com/api/allSTCards/',
-    // NOTE: the documented /api/allPromoCards/ path 404s. This one works.
-    allPromos: 'https://optcgapi.com/api/allPromos/',
-    history: id => `https://optcgapi.com/api/sets/card/twoweeks/${id}/`
-  };
+  /* v2 takes its data from TCGCSV through the Worker; see source.js. The old
+     optcgapi endpoints are gone rather than kept "just in case" — a dead URL
+     left in a config table is an invitation to accidentally read from it. */
 
   return { GRADERS, CONDITIONS, COLLECTION_KINDS, VARIANT_TAGS, RARITY, SLOTS,
-           PROFILES, SETS, API, DON_NON_BOOSTER, DON_SET_CODES, PROMO_SET, COLORS };
+           PROFILES, SETS, DON_NON_BOOSTER, DON_SET_CODES, PROMO_SET, COLORS };
 })();

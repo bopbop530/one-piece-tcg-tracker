@@ -14,10 +14,11 @@ const OQ_COLLECTION = (function (D, E) {
      items:       [{ id, colId, key, qty, cond, grader, grade, paid, note,
                      updatedAt, deleted }]
 
-     `key` is set_id|card_image_id|card_name — the ONLY identifier that is
-     actually unique in this dataset. card_set_id has 723 collisions and
-     card_image_id has 41, so anything shorter silently merges a $108 SP with
-     a $20 parallel. See engine.js cardKey().
+     `key` is TCGplayer's productId — a real primary key, unique across all
+     6,798 cards. v1 used a "set_id|card_image_id|card_name" composite because
+     optcgapi had nothing unique (card_set_id collided 723 times). Rows saved
+     under the old composite are repointed by migrateKeys() below; `oldKey`
+     keeps the original so a migration can be audited or undone.
 
      A graded card carries `grader` + `grade`; `cond` applies to raw copies
      only. There is no free market feed for graded prices, so `paid` (and the
@@ -43,6 +44,184 @@ const OQ_COLLECTION = (function (D, E) {
   /** Older rows predate tradePct; keeps are always 1:1. */
   const rateOf = col =>
     !col ? 100 : (col.tradePct == null ? (col.kind === 'trade' ? 80 : 100) : Number(col.tradePct));
+
+  /* ==========================================================================
+     V1 -> V2 KEY MIGRATION
+
+     v1 rows are keyed "set_id|card_image_id|card_name", a composite invented
+     because optcgapi had no unique id. v2 keys on TCGplayer's productId, which
+     is a real primary key. Every saved row — local and in the sheet — has to
+     be repointed, and rows are the only thing in this app that cannot be
+     re-fetched, so the rule is: never guess, and never drop.
+
+     Matching is on card NAME plus card NUMBER, both of which survived the
+     source change intact. The image id carries a random suffix on variants
+     ("OP04-056_p2", "OP16-011_l76oKss"); the part before the first underscore
+     is the card number, which is what TCGplayer calls extNumber.
+
+     Anything that does not match exactly one card is left untouched and
+     reported, so it shows up in the UI for you to fix by hand rather than
+     silently becoming a $0 row or disappearing.
+     ========================================================================= */
+
+  const isV1Key = key => typeof key === 'string' && key.indexOf('|') > -1;
+
+  function splitV1Key(key) {
+    const a = key.indexOf('|');
+    const b = key.indexOf('|', a + 1);
+    if (a < 0 || b < 0) return null;
+    return {
+      setId: key.slice(0, a),
+      imageId: key.slice(a + 1, b),
+      name: key.slice(b + 1)
+    };
+  }
+
+  /** "OP16-011_l76oKss" -> "OP16-011". Also tolerates a bare number. */
+  const numberFrom = imageId => String(imageId || '').split('_')[0].toUpperCase();
+
+  function buildMatchIndex(cards) {
+    const byNameNum = {};
+    for (const c of cards) {
+      const nm = String(c.card_name || '').toLowerCase().trim();
+      const num = String(c.card_set_id || '').toUpperCase().trim();
+      if (!nm || !num) continue;
+      const k = nm + '|' + num;
+      (byNameNum[k] = byNameNum[k] || []).push(c);
+    }
+    return byNameNum;
+  }
+
+  /**
+   * Repoint v1 keys onto productIds.
+   *
+   * Returns { items, migrated, unmatched, ambiguous, alreadyV2 } — a NEW items
+   * array, never a mutation of the input, so a caller that decides not to
+   * commit the migration still holds intact data.
+   */
+  function migrateKeys(items, cards) {
+    const idx = buildMatchIndex(cards);
+    const out = [];
+    const unmatched = [], ambiguous = [];
+    let migrated = 0, alreadyV2 = 0;
+
+    for (const it of items || []) {
+      if (!isV1Key(it.key)) { alreadyV2++; out.push(it); continue; }
+
+      const parts = splitV1Key(it.key);
+      if (!parts) { unmatched.push(it); out.push(it); continue; }
+
+      const hits = idx[parts.name.toLowerCase().trim() + '|' + numberFrom(parts.imageId)] || [];
+
+      if (hits.length === 1) {
+        // oldKey is kept so the migration is auditable and reversible, and so
+        // a row that later turns out to be mismatched can be traced back.
+        out.push(Object.assign({}, it, {
+          key: String(hits[0].id), oldKey: it.key, updatedAt: Date.now()
+        }));
+        migrated++;
+      } else if (hits.length > 1) {
+        ambiguous.push({ item: it, candidates: hits.map(c => c.id) });
+        out.push(it);
+      } else {
+        unmatched.push(it);
+        out.push(it);
+      }
+    }
+    return { items: out, migrated, unmatched, ambiguous, alreadyV2 };
+  }
+
+  /* ==========================================================================
+     THE PERMANENT BINDERS ARE SINGULAR BY ID, NOT BY LUCK
+
+     "Keeping" and "Trade / Sell" are created automatically on first run. v1
+     minted them with a random uid(), which is fine on one device and wrong the
+     moment there are two: each device generates its OWN pair before the first
+     sync, then pulls the other device's pair, and merge — correctly — keeps
+     all four, because to it they are four distinct rows.
+
+     Fixed ids make them the same row everywhere, so the merge collapses them
+     instead of duplicating them. Installs created before this still carry
+     random ids, which is what dedupePermanent() repairs.
+     ========================================================================= */
+  const PERMANENT_ID = { keep: 'binder-keep', trade: 'binder-trade' };
+
+  function newPermanent(kind) {
+    const now = Date.now();
+    return { id: PERMANENT_ID[kind], name: kind === 'keep' ? 'Keeping' : 'Trade / Sell',
+             kind, tradePct: kind === 'trade' ? 80 : 100,
+             locked: 1, createdAt: now, updatedAt: now, deleted: 0 };
+  }
+
+  const PERMANENT_NAME = { keep: 'keeping', trade: 'trade / sell' };
+
+  /* Is this one of the two automatic binders?
+
+     Deliberately NOT just `locked`. That flag has to survive a round-trip
+     through Google Sheets, and an older deployed Apps Script whose COL_COLS
+     predates the `locked` column drops it silently — the binders come back
+     unlocked and the dedupe below skips them, so the duplicates you were told
+     were fixed are still there.
+
+     Three independent signals, any one of which is enough: the flag, the
+     canonical fixed id, or the exact auto-generated name for that kind. The
+     name test can in principle catch a binder you named "Keeping" yourself,
+     but only if it also matches the kind AND there is more than one — which is
+     the very situation you would want collapsed anyway. */
+  function isPermanent(col, kind) {
+    if (col.locked) return true;
+    if (col.id === PERMANENT_ID[kind]) return true;
+    return String(col.name || '').trim().toLowerCase() === PERMANENT_NAME[kind];
+  }
+
+  /**
+   * Collapse duplicate permanent binders into one per kind.
+   *
+   * Survivor is the canonical fixed id if present, otherwise the OLDEST — the
+   * one most likely to hold the real history. Every item in a losing binder is
+   * moved across before that binder is tombstoned, so nothing is orphaned; an
+   * item pointing at a deleted binder would simply vanish from the UI while
+   * still occupying a row in the sheet.
+   *
+   * Returns new arrays. Never mutates the inputs.
+   */
+  function dedupePermanent(cols, items) {
+    const out = cols.map(c => Object.assign({}, c));
+    const moved = {};                       // losingId -> survivingId
+    let mergedBinders = 0;
+
+    for (const kind of ['keep', 'trade']) {
+      const live = out.filter(c => !c.deleted && c.kind === kind && isPermanent(c, kind));
+      if (live.length < 2) continue;
+
+      const canonical = live.find(c => c.id === PERMANENT_ID[kind]);
+      const survivor = canonical ||
+        live.slice().sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))[0];
+
+      // Re-assert the flag on the survivor: if the sheet stripped it, this puts
+      // it back so the next round-trip is not another rescue operation.
+      if (!survivor.locked) { survivor.locked = 1; survivor.updatedAt = Date.now(); }
+
+      for (const c of live) {
+        if (c.id === survivor.id) continue;
+        moved[c.id] = survivor.id;
+        c.deleted = 1;
+        c.updatedAt = Date.now();
+        mergedBinders++;
+      }
+    }
+
+    if (!mergedBinders) return { cols, items, mergedBinders: 0, movedItems: 0 };
+
+    let movedItems = 0;
+    const outItems = items.map(it => {
+      if (!moved[it.colId]) return it;
+      movedItems++;
+      return Object.assign({}, it, { colId: moved[it.colId], updatedAt: Date.now() });
+    });
+
+    return { cols: out, items: outItems, mergedBinders, movedItems };
+  }
 
   /**
    * `value` and `paid` are deliberately separate.
@@ -79,7 +258,7 @@ const OQ_COLLECTION = (function (D, E) {
    * than scored, because "spent $600, pulled $0" almost always means you have
    * not finished logging.
    */
-  function scoreboard(opens, items, priceFor, setName, isBooster) {
+  function scoreboard(opens, items, priceFor, setName, isBooster, setIdFor) {
     const bySet = {};
     const touch = id => (bySet[id] = bySet[id] || {
       setId: id, name: setName ? setName(id) : id,
@@ -93,7 +272,10 @@ const OQ_COLLECTION = (function (D, E) {
     }
     for (const it of live(items)) {
       if (it.src !== 'pull') continue;
-      const setId = it.key.split('|')[0];
+      // v1 encoded the set in the key; v2 keys are opaque productIds, so the
+      // set has to come from the card record. Splitting the key here silently
+      // produced a phantom set id once the keys changed.
+      const setId = setIdFor(it.key);
       // Belt and braces against a card marked "pulled" that could never have
       // come from a pack — a promo or starter-deck row would otherwise invent
       // a phantom set with winnings and no spend, inflating the return.
@@ -138,9 +320,17 @@ const OQ_COLLECTION = (function (D, E) {
      would let it resurrect from whichever device had not synced yet.
      ========================================================================== */
   function mergeRows(local, remote) {
+    // A sync payload missing a key, or a proxy returning something unexpected,
+    // used to throw "remote is not iterable" out of pullNow and abandon the
+    // whole merge — including the arrays that DID arrive intact. Treat absent
+    // as empty: nothing to merge is a valid state, a crash is not.
+    if (!Array.isArray(local))  local = [];
+    if (!Array.isArray(remote)) remote = [];
+
     const byId = {};
-    for (const row of local)  byId[row.id] = row;
+    for (const row of local)  { if (row && row.id != null) byId[row.id] = row; }
     for (const row of remote) {
+      if (!row || row.id == null) continue;
       const mine = byId[row.id];
       if (!mine || (row.updatedAt || 0) > (mine.updatedAt || 0)) byId[row.id] = row;
     }
@@ -160,6 +350,34 @@ const OQ_COLLECTION = (function (D, E) {
    * and are counted separately so a big graded holding cannot quietly inflate
    * a number that is otherwise live.
    */
+  /** Sane quantity: a non-negative integer, never NaN, never absurd. */
+  function qtyOf(it) {
+    const n = Math.floor(Number(it && it.qty));
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return Math.min(n, 9999);
+  }
+
+  /**
+   * Items that are live AND whose binder is live.
+   *
+   * A sync race makes these: device A deletes a binder while device B adds a
+   * card to it. Merge keeps both — correctly, they are independent rows — and
+   * the card becomes invisible in the UI while still counting toward your
+   * total. The number says $X and you cannot find the cards.
+   */
+  function livePlaced(items, cols) {
+    const ok = {};
+    for (const c of live(cols)) ok[c.id] = true;
+    return live(items).filter(it => ok[it.colId]);
+  }
+
+  /** The opposite set: live rows stranded on a deleted binder. */
+  function orphans(items, cols) {
+    const ok = {};
+    for (const c of live(cols)) ok[c.id] = true;
+    return live(items).filter(it => !ok[it.colId]);
+  }
+
   function valueOf(items, priceFor) {
     let raw = 0, graded = 0, cards = 0, unpriced = 0, cost = 0;
     // Gain is only meaningful against cards you actually recorded a cost for.
@@ -167,7 +385,10 @@ const OQ_COLLECTION = (function (D, E) {
     let costedValue = 0, costedCards = 0;
 
     for (const it of live(items)) {
-      const qty = Number(it.qty) || 0;
+      // A negative or non-numeric qty silently SUBTRACTS from your collection
+      // value, and a pasted or synced row can carry either. Clamped rather
+      // than trusted; 9,999 is far past any real holding of one card.
+      const qty = qtyOf(it);
       cards += qty;
       const hasCost = it.paid != null && it.paid !== '';
       if (hasCost) {
@@ -333,7 +554,9 @@ const OQ_COLLECTION = (function (D, E) {
 
   return {
     uid, newCollection, newItem, newOpen, isGraded, rateOf,
-    mergeRows, live, valueOf, group, scoreboard,
+    mergeRows, live, livePlaced, orphans, qtyOf, valueOf, group, scoreboard,
+    migrateKeys, isV1Key, splitV1Key, numberFrom,
+    dedupePermanent, newPermanent, PERMANENT_ID, isPermanent,
     validUrl, diagnose, pull, push
   };
 })(OQ_DATA, OQ_ENGINE);

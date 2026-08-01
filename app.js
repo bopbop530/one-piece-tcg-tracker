@@ -12,6 +12,7 @@
   const KEY = {
     cards:  'oq.cards.v1',
     boxes:  'oq.boxes.v1',
+    perCase: 'oq.percase.v1',
     rates:  'oq.rates.v1',
     setRates: 'oq.setrates.v1',
     prefs:  'oq.prefs.v1',
@@ -71,10 +72,12 @@
     byKey: {},                       // cardKey -> card, for collection lookups
     tab: 'rip',
     boxes:  load(KEY.boxes, {}),     // setId -> user box price (Set Explorer only)
+    perCase: load(KEY.perCase, {}),  // setId -> boxes per case, when it is not 12
     rates:    load(KEY.rates, {}),     // profile -> { perBox, packsPerBox }
     setRates: load(KEY.setRates, {}),  // setId   -> { perBox, packsPerBox }
     prefs:  load(KEY.prefs, { friction: 100, advanced: false }),
     ripSet: null, ripCard: null, ripSearch: '', ripRarity: 'all', ripColor: 'all',
+    sigSearch: '', sigRarity: 'all', sigColor: 'all',
     rateScope: null,                 // which scope the pull-rate editor is on
     sigAutoScanned: false,
     scanning: false, scanAbort: false,
@@ -135,12 +138,55 @@
     };
   }
 
+  /* Three tiers, most trustworthy first:
+       1. what YOU typed        — you know what you actually paid
+       2. TCGplayer's live box  — real market, new in v2
+       3. the estimate in data.js — only when a set has no sealed listing at
+          all, which happens for sold-out and not-yet-released sets
+
+     Only tier 3 is marked EST. v1 marked everything EST because every box
+     price was a hardcoded guess. */
   function boxPrice(setId) {
     if (S.boxes[setId] != null) return S.boxes[setId];
+    const live = sealedPrice(setId, 'box');
+    if (live != null) return live;
     const m = setMeta(setId);
     return m ? m.box : 0;
   }
-  const boxIsEstimate = setId => S.boxes[setId] == null;
+  const boxIsEstimate = setId =>
+    S.boxes[setId] == null && sealedPrice(setId, 'box') == null;
+
+  /** Live case price. No estimate fallback — an unlisted case is simply unknown. */
+  const casePrice = setId => sealedPrice(setId, 'case');
+
+  /* Boxes in a sealed case. 12 is standard for OP boosters, but I have not
+     verified it for Premium Boosters and the source does not state it, so it
+     is editable per set rather than asserted. */
+  const DEFAULT_PER_CASE = 12;
+  const boxesPerCase = setId => Number(S.perCase[setId]) || DEFAULT_PER_CASE;
+
+  /**
+   * Is a case cheaper per box than buying boxes?
+   *
+   * Worth asking because the answer is not consistent — measured across the
+   * catalogue it ranges from 27.6% cheaper (PRB-02) to 8.1% MORE expensive
+   * (OP-13). Returns null when either price is missing rather than guessing.
+   */
+  function caseDeal(setId) {
+    const box = sealedPrice(setId, 'box');
+    const kase = casePrice(setId);
+    if (!box || !kase) return null;
+
+    const per = boxesPerCase(setId);
+    const perBox = kase / per;
+    const saving = 1 - (perBox / box);      // >0 means the case is cheaper
+    return {
+      box, case: kase, per, perBox, saving,
+      // A few percent either way is noise against shipping and the cash
+      // you tie up, so only a real gap is called either way.
+      verdict: saving >= 0.05 ? 'case' : saving <= -0.05 ? 'boxes' : 'even'
+    };
+  }
 
   const priceOf = card => card.market_price || 0;
 
@@ -293,88 +339,86 @@
     return out;
   }
 
+  /* The card cache was 3,092 KB of a ~5 MB localStorage budget — 62% spent on
+     one key, with the user's collection sharing the same quota. saveCritical()
+     already drops this cache when a write fails, but living that close to the
+     ceiling means the first symptom is a failed save of data you typed.
+
+     Five fields, ~1.1 MB, are removed on the way in:
+       card_image (485 KB)  derivable from id — it IS the id in a fixed URL
+       set_name   (257 KB)  derivable from set_id via D.SETS
+       direct_low (133 KB)  null on every single card; TCGplayer never fills it
+       high_price (112 KB)  polluted with $9,999 placeholder listings and
+                            deliberately never displayed
+       printing   (112 KB)  read nowhere outside source.js
+
+     Everything still needed is rebuilt on read, so the rest of the app never
+     learns this happened. */
+  const IMG_BASE = 'https://tcgplayer-cdn.tcgplayer.com/product/';
+
+  function slimCard(c) {
+    const o = Object.assign({}, c);
+    delete o.card_image; delete o.set_name; delete o.printing;
+    delete o.high_price; delete o.direct_low_price;
+    // Only drop the image when it is exactly what we can rebuild.
+    if (c.card_image !== IMG_BASE + c.id + '_400w.jpg') o.card_image = c.card_image;
+    return o;
+  }
+
+  function fatCard(c) {
+    if (c.card_image == null) c.card_image = IMG_BASE + c.id + '_400w.jpg';
+    if (c.set_name == null) {
+      const m = setMeta(c.set_id);
+      c.set_name = m ? m.name : c.set_id;
+    }
+    return c;
+  }
+
   async function fetchCards(force) {
     if (!force) {
       const cached = load(KEY.cards, null);
-      if (cached && cached.rows && cached.rows.length) {
-        applyCards(cached.rows, cached.at);
+      // v1 rows are keyed on the old composite and carry no productId. Loading
+      // them into a v2 app would look fine and be subtly wrong everywhere, so
+      // a cache without ids is discarded and refetched rather than migrated.
+      if (cached && cached.rows && cached.rows.length && cached.rows[0].id != null) {
+        applyCards(cached.rows.map(fatCard), cached.at, cached.products || []);
         return { fromCache: true };
       }
     }
-    // Four separate catalogues. Only the first is required; the rest degrade
-    // to "those cards are missing" rather than breaking the app.
-    const [res, donRes, deckRes, promoRes] = await Promise.all([
-      fetch(D.API.allCards, { cache: 'no-store' }),
-      fetch(D.API.allDon, { cache: 'no-store' }).catch(() => null),
-      fetch(D.API.allDecks, { cache: 'no-store' }).catch(() => null),
-      fetch(D.API.allPromos, { cache: 'no-store' }).catch(() => null)
-    ]);
-    if (!res.ok) throw new Error('API returned HTTP ' + res.status);
-    let rows = await res.json();
-    if (!Array.isArray(rows) || !rows.length) throw new Error('API returned no cards');
+    // v2: one CSV per set from TCGCSV, through the Worker. source.js does the
+    // parsing and shaping; this function only decides what to keep and when.
+    //
+    // The set list is built from the live group list rather than hardcoded, so
+    // a set TCGplayer adds tomorrow shows up without a code change — it lands
+    // in the promo namespace until it is given pull rates in data.js.
+    const sets = await SRC.buildSets(D.SETS);
+    const { cards, products, failed } = await SRC.loadAll(sets);
 
-    if (donRes && donRes.ok) {
-      try { rows = rows.concat(normaliseDons(await donRes.json())); } catch (_) {}
-    }
-    if (deckRes && deckRes.ok) {
-      // Starter decks already carry clean ST-xx set ids that cannot clash with
-      // booster ids, so they only need marking as non-pack product.
-      try {
-        rows = rows.concat((await deckRes.json()).map(c =>
-          Object.assign({}, c, { productKind: 'deck' })));
-      } catch (_) {}
-    }
-    if (promoRes && promoRes.ok) {
-      try {
-        rows = rows.concat((await promoRes.json()).map(c => Object.assign({}, c, {
-          productKind: 'promo',
-          // Promos keep their ORIGINATING set in set_id ("OP09"), which both
-          // collides with booster ids and would drop judge cards into pack
-          // pools. 296 of them already share a card_image_id with a booster
-          // card, so they get their own namespace and the origin is preserved
-          // separately for display.
-          originSet: c.set_id,
-          set_id: D.PROMO_SET
-        })));
-      } catch (_) {}
+    if (!cards.length) {
+      throw new Error(failed.length
+        ? `No cards loaded. First failure: ${failed[0].set} — ${failed[0].error}`
+        : 'No cards returned by the data source');
     }
 
-    // Trim before caching — card_text is most of the payload and we never use it.
-    const slim = rows.map(c => ({
-      card_set_id: c.card_set_id,
-      card_image_id: c.card_image_id,
-      card_name: c.card_name,
-      set_id: c.set_id,
-      set_name: c.set_name,
-      rarity: c.rarity,
-      market_price: c.market_price,
-      inventory_price: c.inventory_price,
-      card_color: c.card_color,
-      card_type: c.card_type,
-      card_image: c.card_image,
-      date_scraped: c.date_scraped,
-      // DON!! only — undefined on normal cards and dropped by JSON.stringify.
-      donBooster: c.donBooster,
-      donProduct: c.donProduct,
-      donVariant: c.donVariant,
-      // Non-booster product: 'deck' | 'promo', undefined for pack cards.
-      productKind: c.productKind,
-      originSet: c.originSet
-    }));
+    // A partial load is worth keeping — 83 of 84 sets is far better than
+    // nothing — but it must not be cached as if it were complete, or one bad
+    // afternoon would freeze a hole in the data until the next manual refresh.
+    const complete = failed.length === 0;
+
     const at = new Date().toISOString();
-    save(KEY.cards, { at, rows: slim });
-    applyCards(slim, at);
-    return { fromCache: false };
+    if (complete) save(KEY.cards, { at, rows: cards.map(slimCard), products });
+    applyCards(cards, at, products);
+    S.loadFailures = failed;
+    return { fromCache: false, failed };
   }
 
-  function applyCards(rows, at) {
+  function applyCards(rows, at, products) {
     S.fetchedAt = at;
     S.bySet = {};
     S.byKey = {};
-    // A handful of records arrive twice, byte-identical (four across 5,292 —
-    // two ST-25 cards, a Gecko Moria). Harmless individually, but a duplicate
-    // sits in its slot pool twice and skews that slot's average, so they are
-    // collapsed on the way in.
+    // Dedupe is kept even though productId is unique, because it costs nothing
+    // and the cost of being wrong is a card counted twice in its slot pool,
+    // which quietly skews that slot's average and every EV built on it.
     const deduped = [];
     for (const c of rows) {
       const k = E.cardKey(c);
@@ -384,44 +428,62 @@
       (S.bySet[c.set_id] = S.bySet[c.set_id] || []).push(c);
     }
     S.cards = deduped;
+
+    // Sealed products, indexed by set. v1 had none of this — box prices were
+    // hardcoded estimates in data.js.
+    S.products = products || [];
+    S.sealedBySet = {};
+    for (const p of S.products) {
+      (S.sealedBySet[p.set_id] = S.sealedBySet[p.set_id] || []).push(p);
+    }
+
     S.browseSets = null;        // rebuilt lazily from the new card data
     invalidate();
   }
 
-  /**
-   * Which cards are wearing the wrong picture.
-   *
-   * Not guessed — measured. Every one of the source's 5,148 card images was
-   * downloaded and hashed, and imgflags.js lists the ones that came back
-   * byte-identical to a different card's image. Structural guessing was tried
-   * first and was wrong in both directions: it missed the cross-set cases
-   * (Carrot SP $109, Rebecca SP $128, Gum-Gum Giant Manga $410) and falsely
-   * accused Air Door and Gum-Gum Red Roc, whose art genuinely differs.
-   *
-   * Keyed on image filename because it is unique across the whole catalogue
-   * and survives the set_id rewriting normaliseDons() does.
-   */
-  const IMG_FLAG = (function () {
-    const m = {};
-    for (const row of (window.IMG_FLAGS || [])) m[row[0]] = { kind: row[1], other: row[2] };
-    return m;
-  })();
-
-  function artFlag(card) {
-    if (!card || !card.card_image) return null;
-    return IMG_FLAG[card.card_image.split('/').pop()] || null;
+  /* Live sealed price for a set, or null when TCGplayer has no listing —
+     a set can be sold out, or not on sale yet. Callers fall back to the
+     estimate in data.js and mark it EST. */
+  /* Share of a set's cards that carry a market price. */
+  function pricedShare(setId) {
+    const rows = S.bySet[setId] || [];
+    if (!rows.length) return 0;
+    let n = 0;
+    for (const c of rows) if (c.market_price > 0) n++;
+    return n / rows.length;
   }
 
-  /** Plain-language version of a flag, for tooltips and the card page. */
-  function artFlagText(fl) {
-    if (!fl) return '';
-    return fl.kind === 0
-      ? 'The source has no picture for this card. What it serves is a generic ' +
-        '"coming soon" graphic shared by 30 cards, so nothing is shown instead.'
-      : 'The picture here is not this card. The source serves the identical ' +
-        'file for ' + fl.other + ' — verified byte-for-byte. The real artwork ' +
-        'is not on their server, so it cannot be corrected.';
+  /* The newest set worth LANDING on.
+
+     "Newest" alone is wrong. TCGplayer creates product records for a set
+     before it has data: OP-17 arrives with 45 cards, 3 of them priced, and
+     images that return 403 — so defaulting to it meant a first-time user
+     opened the app on a grid of empty placeholders with no numbers. Walk back
+     from the newest until a set has enough real data to be worth showing. */
+  function defaultSetId(sets) {
+    if (!sets || !sets.length) return null;
+    for (let i = sets.length - 1; i >= 0; i--) {
+      if (pricedShare(sets[i].id) >= 0.5) return sets[i].id;
+    }
+    return sets[sets.length - 1].id;
   }
+
+  function sealedPrice(setId, kind) {
+    // Called from boxPrice, which renders before the first load completes.
+    const list = (S.sealedBySet && S.sealedBySet[setId]) || [];
+    const hit = list.find(p => p.kind === kind && p.market_price > 0);
+    return hit ? hit.market_price : null;
+  }
+
+  /* Wrong-artwork flagging is GONE in v2, and that is the point.
+     optcgapi stored one picture per card NUMBER, so 55 cards were served
+     another printing's artwork and 30 more got a "coming soon" placeholder;
+     imgflags.js existed to own up to that. TCGplayer stores one picture per
+     PRODUCT, so OP-16 Vista and Vista (TR) are different files — verified.
+     Nothing left to flag, so the flag is deleted rather than left returning
+     null forever. */
+  const artFlag = () => null;
+  const artFlagText = () => '';
 
   /**
    * Booster products only. Everything that computes odds, box EV or supply
@@ -617,11 +679,26 @@
 
   function renderRipControls() {
     const sets = liveSets();
-    if (!S.ripSet || !sets.some(s => s.id === S.ripSet)) S.ripSet = sets.length ? sets[sets.length - 1].id : null;
+    if (!S.ripSet || !sets.some(s => s.id === S.ripSet)) S.ripSet = defaultSetId(sets);
 
+    // A set TCGplayer has created but not populated is marked, so choosing it
+    // and finding empty art and no numbers is an informed decision rather than
+    // a bug you have to diagnose.
     $('#rip-set').innerHTML = sets.map(s =>
-      `<option value="${esc(s.id)}"${s.id === S.ripSet ? ' selected' : ''}>${esc(s.short)} · ${esc(s.name)}</option>`
+      `<option value="${esc(s.id)}"${s.id === S.ripSet ? ' selected' : ''}>${
+        esc(s.short)} · ${esc(s.name)}${pricedShare(s.id) < 0.5 ? ' — no data yet' : ''}</option>`
     ).join('');
+
+    const thin = pricedShare(S.ripSet) < 0.5;
+    const note = $('#rip-thin');
+    if (note) {
+      note.innerHTML = thin
+        ? `<div class="note warn small" style="margin-bottom:10px">
+             <b>${esc(setShort(S.ripSet))} has almost no data yet.</b> TCGplayer lists the cards
+             but has not published prices or artwork for most of them, so odds and value here
+             are not meaningful. Nothing is broken — the set is simply too new.</div>`
+        : '';
+    }
 
     renderRarityFilter();
     const opts = ripCardOptions();
@@ -657,6 +734,28 @@
       renderRip();
       const sel = $('#rip-grid .pick.sel');
       if (sel) sel.scrollIntoView({ block: 'nearest' });
+
+      /* On a phone the answer renders ~800px below the fold, so tapping a card
+         looked like it did nothing until you scrolled most of a screen. On a
+         wide layout the panel is already beside the grid, so scrolling there
+         would yank the page for no reason — hence the width check, not a
+         blanket scroll. */
+      if (window.matchMedia('(max-width: 860px)').matches) {
+        const out = $('#rip-out');
+        if (out) {
+          const before = window.scrollY;
+          out.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          // Smooth scrolling is a silent no-op in some engines — measured here,
+          // where it left scrollY at 0 while a plain call moved 771px. Landing
+          // the user nowhere is far worse than landing them there abruptly, so
+          // if nothing has moved shortly after, do it the guaranteed way.
+          setTimeout(() => {
+            if (Math.abs(window.scrollY - before) < 8) {
+              out.scrollIntoView({ block: 'start' });
+            }
+          }, 350);
+        }
+      }
     }));
 
     fitGridRows('#rip-grid', 2);
@@ -677,8 +776,94 @@
     return { code: 'BUY', title: 'BUY THE SINGLE' };
   }
 
+  /* Everything sealed for the current set: what it costs, whether a case beats
+     boxes, what the cards inside are worth, and the products v1 could not see
+     at all (Double Pack Sets, sleeved packs, DON!! packs). */
+  function renderSealed() {
+    const out = $('#sealed-out');
+    if (!out) return;
+    const setId = S.ripSet;
+    const list = (S.sealedBySet[setId] || []).filter(p => p.market_price > 0);
+
+    if (!list.length) {
+      out.innerHTML = `<div class="panel" style="margin-bottom:18px"><div class="panel-b small muted">
+        No sealed product listed for ${esc(setShort(setId))} — usually means it is sold out
+        or not on sale yet. Box price falls back to the estimate in settings.</div></div>`;
+      return;
+    }
+
+    const deal = caseDeal(setId);
+    const idx = indexFor(setId);
+    const cfg = configFor(setId);
+    const evBox = idx ? E.evaluate(idx, cfg).evBox : null;
+    const box = sealedPrice(setId, 'box');
+
+    // Order the way you would actually shop: biggest commitment first.
+    const rank = { case: 0, box: 1, display: 2, deck: 3, sleevedpack: 4, pack: 5, other: 6 };
+    list.sort((a, b) => (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9) || b.market_price - a.market_price);
+
+    const dealBox = !deal ? '' : `
+      <div class="verdict ${deal.verdict === 'case' ? 'RIP' : deal.verdict === 'boxes' ? 'BUY' : 'COINFLIP'}"
+           style="text-align:left;margin-bottom:14px">
+        <div class="lbl">Case or boxes</div>
+        <div class="big">${
+          deal.verdict === 'case'  ? `Buy the case — ${E.pct(deal.saving, 0)} cheaper per box`
+        : deal.verdict === 'boxes' ? `Buy boxes — the case costs ${E.pct(-deal.saving, 0)} more per box`
+        :                            'Either — under 5% apart'}</div>
+        <div class="sub">
+          A case is <b>${E.money(deal.case)}</b> for <b>${deal.per}</b> boxes, so
+          <b>${E.money(deal.perBox)}</b> each against <b>${E.money(deal.box)}</b> buying singly.
+          ${boxesPerCase(setId) === DEFAULT_PER_CASE
+            ? `<span class="muted">Assumes ${DEFAULT_PER_CASE} boxes per case — change it in Settings if this product differs.</span>` : ''}
+        </div>
+      </div>`;
+
+    // The comparison you asked for: two measured numbers, no projection.
+    const evBlock = (box && evBox != null) ? `
+      <div class="grid g-2" style="gap:12px;margin-bottom:12px">
+        ${stat('Box costs', E.money(box), 'live TCGplayer market')}
+        ${stat('Cards inside are worth', E.money(evBox),
+               'modelled from pull rates', evBox >= box ? 'hero' : '')}
+      </div>
+      <div class="small muted" style="margin-bottom:14px;line-height:1.5">
+        ${evBox >= box
+          ? `The cards model out <b class="up">${E.money(evBox - box)}</b> above what the box costs.`
+          : `The box costs <b class="down">${E.money(box - evBox)}</b> more than the cards model out to.`}
+        Both numbers are real, but they are not the same kind of number: the box price is
+        what the market charges today, the card value is an <em>average</em> across the
+        whole set — most boxes land under it, a few far above. It also assumes you sell
+        everything at market, which no one does.
+      </div>` : '';
+
+    out.innerHTML = `
+      <div class="panel" data-collapse="sealed" data-collapse-mobile style="margin-bottom:18px">
+        <div class="panel-h"><h2>Sealed — ${esc(setShort(setId))}</h2>
+          <span class="small muted" style="margin-left:auto">${list.length} product${list.length === 1 ? '' : 's'}</span>
+        </div>
+        <div class="panel-b">
+          ${dealBox}
+          ${evBlock}
+          <div class="tbl-scroll"><table class="tbl">
+            <thead><tr><th>Product</th><th class="num">Market</th><th class="num">Lowest</th><th></th></tr></thead>
+            <tbody>${list.map(p => `
+              <tr>
+                <td>${esc(p.name)}</td>
+                <td class="num"><b>${E.money(p.market_price)}</b></td>
+                <td class="num muted">${p.low_price ? E.money(p.low_price) : '—'}</td>
+                <td class="num">${p.buy_url
+                  ? `<a class="btn ghost small" href="${esc(p.buy_url)}" target="_blank" rel="noopener nofollow">Buy</a>`
+                  : ''}</td>
+              </tr>`).join('')}
+            </tbody>
+          </table></div>
+        </div>
+      </div>`;
+    wireCollapsibles();
+  }
+
   function renderRip() {
     renderRipControls();
+    renderSealed();
     const out = $('#rip-out');
 
     if (!S.ripSet || !S.ripCard) {
@@ -695,7 +880,6 @@
     const card   = prob.entry.card;
     const single = prob.entry.price;
     const packs  = cfg.packsPerBox;
-    const stale  = E.staleness(card, null);
 
     if (prob.impossible) {
       out.innerHTML = panelMsg(
@@ -745,7 +929,7 @@
               <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
                 <span class="tag slot-${esc(prob.slot)}">${esc(prob.entry.variantLabel || (D.RARITY[prob.slot] || {}).label || prob.slot)}</span>
                 <span class="mono small muted">${esc(card.card_set_id)}</span>
-                ${stale != null && stale > 21 ? `<span class="tag est">price ${stale}d old</span>` : ''}
+
                 ${owned ? `<span class="tag" style="color:var(--up);border-color:#2a6b4a">✓ you own ${owned.qty}</span>` : ''}
                 ${heroFlag
                   ? `<span class="tag est" title="${esc(artFlagText(heroFlag))}">⚠ ${
@@ -767,10 +951,12 @@
               </div>
               <div class="small muted" style="margin-bottom:14px;line-height:1.5">
                 ${sig ? `Listing is <b>${E.pct(sig.ratio, 0)}</b> of market — <b>${esc(sig.state)}</b> supply. ` : ''}
-                ${stale != null ? `Priced <b>${stale === 0 ? 'today' : stale + ' day' + (stale === 1 ? '' : 's') + ' ago'}</b>. ` : ''}
-                <span title="Market price is a weighted average of recent completed sales. The listing is the cheapest copy for sale right now — the API does not expose a condition breakdown, so it is whatever the seller listed. On chase cards the two track closely (98% of market above $500); the big gaps are on bulk, where a penny listing sits under a 10c sold average.">
+                <span title="Market price is TCGplayer's weighted average of recent completed sales. The listing is the cheapest copy for sale right now — no condition breakdown is published, so it is whatever the seller listed. The gap between them widens with price: at $500+ the median card is listed AT or above its sold average.">
                   Why these differ ⓘ</span>
               </div>
+              ${card.buy_url ? `
+                <a class="btn primary" href="${esc(card.buy_url)}" target="_blank" rel="noopener nofollow"
+                   style="margin-bottom:14px;display:inline-block">View on TCGplayer</a>` : ''}
 
               <div class="verdict ${v.code}" style="text-align:left">
                 <div class="lbl">Verdict</div>
@@ -792,12 +978,6 @@
 
       ${fitNote}
 
-      <div class="panel" id="hist-panel">
-        <div class="panel-h"><h2>13-day price history</h2>
-          <span class="small muted" style="margin-left:auto" id="hist-note">loading…</span></div>
-        <div class="panel-b" id="hist-body"><div class="small muted">Fetching…</div></div>
-      </div>
-
       <div class="note small" style="margin-top:18px">
         Odds assume every card in the <b>${esc(prob.slot)}</b> slot is equally likely — Bandai does not publish
         per-card weighting, so nobody can do better than that. Real boxes are also not independent:
@@ -813,8 +993,6 @@
         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openLightbox(card); }
       });
     }
-
-    loadHistory(card);
   }
 
   /* ---- full-size card view ---------------------------------------------- */
@@ -908,166 +1086,6 @@
       <div class="k">${k}</div><div class="v">${v}</div>${s ? `<div class="s">${s}</div>` : ''}</div>`;
   }
 
-  /* ---------------------------------------------------- price history ---
-     The whole Rip panel re-renders on every keystroke and every drag of the
-     friction slider. Without a cache that meant one API call per render — a
-     single slider sweep could fire dozens of requests for data that had not
-     changed. Results are memoised per card, and an in-flight promise is stored
-     so concurrent renders share one request instead of racing.                */
-
-  /**
-   * cardKey -> settled result, or a pending Promise.
-   *
-   * Seeded from localStorage so a full scan survives a reload. Without that,
-   * scanning 342 cards took ~8s and was thrown away the moment you refreshed —
-   * the request cost was being paid over and over for data that changes once a
-   * day. Entries carry their own timestamp and expire individually.
-   */
-  const HIST_TTL = 12 * 3600 * 1000;   // prices move daily; half a day is plenty
-  const HIST = {};
-
-  (function seedHistFromDisk() {
-    const raw = load(KEY.hist, null);
-    if (!raw || !raw.e) return;
-    const now = Date.now();
-    for (const k in raw.e) {
-      const rec = raw.e[k];
-      if (rec && rec.t && now - rec.t < HIST_TTL && rec.h) HIST[k] = { ok: true, h: rec.h, t: rec.t };
-    }
-  })();
-
-  let histDirty = false, histSaveTimer = null;
-  function persistHist(immediate) {
-    histDirty = true;
-    clearTimeout(histSaveTimer);
-    const run = () => {
-      if (!histDirty) return;
-      histDirty = false;
-      const now = Date.now(), e = {};
-      for (const k in HIST) {
-        const v = HIST[k];
-        // Promises and failures are never persisted.
-        if (!v || typeof v.then === 'function' || !v.ok || !v.h) continue;
-        const t = v.t || now;
-        if (now - t < HIST_TTL) e[k] = { t, h: v.h };
-      }
-      save(KEY.hist, { e });      // non-critical: worst case it rescans
-    };
-    if (immediate) run(); else histSaveTimer = setTimeout(run, 1200);
-  }
-
-  async function fetchHistory(card) {
-    try {
-      const res = await fetch(D.API.history(card.card_set_id));
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const rows = await res.json();
-      // card_set_id is shared by base + parallel prints; match the exact variant.
-      const row = rows.find(x => x.card_image_id === card.card_image_id) || rows[0];
-      const h = row ? E.parseHistory(row) : null;
-      return h ? { ok: true, h } : { ok: false, msg: 'Not enough data points.' };
-    } catch (err) {
-      return { ok: false, msg: 'Could not load history (' + err.message + ').', retry: true };
-    }
-  }
-
-  function paintHistory(result) {
-    const note = $('#hist-note'), body = $('#hist-body');
-    if (!note || !body) return;
-
-    if (!result.ok) {
-      note.textContent = result.retry ? 'unavailable' : 'no history';
-      body.innerHTML = `<div class="small muted">${esc(result.msg)}</div>`;
-      return;
-    }
-    const h = result.h;
-
-    if (h.frozen) {
-      note.innerHTML = `<span class="muted">no movement recorded</span>`;
-      body.innerHTML = `
-        <div class="note warn small">
-          <strong>This price has not changed once in 13 days.</strong>
-          TCGplayer's market price is a rolling average of <em>recent completed sales</em>,
-          so an identical figure every day almost always means the card has not been
-          repriced — not that the market is steady. Expensive chase cards trade rarely,
-          which is exactly why they go stale: 32 of the cards over $50 in this database
-          were last priced more than 180 days ago.
-          Treat <b>${E.money(h.last)}</b> as a last-known figure, not a live one.
-        </div>`;
-      return;
-    }
-
-    const dir = h.changePct >= 0 ? 'up' : 'down';
-    note.innerHTML = `<span class="${dir}">${h.changePct >= 0 ? '▲' : '▼'} ${E.pct(Math.abs(h.changePct))}</span> over 13 days`;
-    body.innerHTML = `
-      <div class="grid g-4" style="margin-bottom:14px">
-        ${stat('Now', E.money(h.last))}
-        ${stat('13 days ago', E.money(h.first))}
-        ${stat('Range', E.money(h.min) + ' – ' + E.money(h.max))}
-        ${stat('Volatility', E.pct(h.volatility))}
-      </div>
-      ${sparkline(h.series, h.changePct >= 0)}`;
-  }
-
-  /**
-   * DON!! cards carry the literal string "DON" as their card id, so the
-   * per-card history endpoint 404s for every one of them. Left unguarded they
-   * failed, got evicted for retry, and were re-requested on every single scan —
-   * 42 wasted calls a sweep, permanently, against a free API.
-   */
-  const hasHistory = card =>
-    card.rarity !== 'DON' && !!card.card_set_id && card.card_set_id !== 'DON';
-
-  /** Fill the cache for one card. No DOM. Shared by the panel and the scanner. */
-  async function loadHistoryFor(card) {
-    const key = E.cardKey(card);
-
-    if (!hasHistory(card)) {
-      // Settled and non-retryable, so it is asked for exactly once.
-      return (HIST[key] = { ok: false, noHistory: true,
-        msg: 'DON!! cards have no per-card price history in this API.' });
-    }
-
-    const cached = HIST[key];
-    if (cached && typeof cached.then !== 'function') return cached;
-
-    // Either join the in-flight request or start one.
-    const pending = cached || (HIST[key] = fetchHistory(card));
-    const result = await pending;
-    if (result.ok) result.t = Date.now();
-    HIST[key] = result;
-    // A failed lookup should not be cached forever — let the next visit retry.
-    if (!result.ok && result.retry) delete HIST[key];
-    else if (result.ok) persistHist();
-    return result;
-  }
-
-  async function loadHistory(card) {
-    if (!$('#hist-body')) return;
-    const key = E.cardKey(card);
-    const settled = HIST[key];
-    if (settled && typeof settled.then !== 'function') { paintHistory(settled); return; }
-
-    const result = await loadHistoryFor(card);
-    // The user may have moved on while this was in flight; don't stomp the panel.
-    if (S.ripCard === key) paintHistory(result);
-  }
-
-  function sparkline(series, rising) {
-    const w = 100, h = 30, pad = 2;
-    const min = Math.min.apply(null, series), max = Math.max.apply(null, series);
-    const span = (max - min) || 1;
-    const pts = series.map((v, i) => {
-      const x = pad + (i / (series.length - 1)) * (w - pad * 2);
-      const y = pad + (1 - (v - min) / span) * (h - pad * 2);
-      return x.toFixed(2) + ',' + y.toFixed(2);
-    });
-    const col = rising ? 'var(--up)' : 'var(--down)';
-    return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="13 day price trend">
-      <polyline points="${pts.join(' ')}" fill="none" stroke="${col}" stroke-width="1.1"
-                stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
-    </svg>`;
-  }
-
   /* ======================================================= SET EXPLORER == */
 
   function setRows() {
@@ -1094,6 +1112,7 @@
         over5Count: idx.all.reduce((n, e) => e.price >= 5 ? n + 1 : n, 0),
         cards: (S.bySet[s.id] || []).length,
         est: boxIsEstimate(s.id),
+        case_: casePrice(s.id),
         unverified: !cfg.verified || !E.configFit(idx, cfg).ok
       };
     });
@@ -1116,6 +1135,7 @@
         <td><b>${esc(r.short)}</b> <span class="muted small">${esc(r.name)}</span>
           ${r.unverified ? ' <span class="tag est" title="Pack structure is not officially documented — expected value here is a rough read">?</span>' : ''}</td>
         <td class="num">${E.money(r.box)}${r.est ? ' <span class="tag est">EST</span>' : ''}</td>
+        <td class="num">${r.case_ == null ? '<span class="muted">—</span>' : E.money(r.case_)}</td>
         <td class="num">${E.money(r.evBox)}</td>
         <td class="num">${E.money(r.evPack)}</td>
         <td class="num ${r.roi == null ? '' : r.roi >= 0 ? 'up' : 'down'}">
@@ -1145,9 +1165,16 @@
   const TAG_RANK = { BUY: 5, TRIM: 4, HOLD: 3, WATCH: 2, AVOID: 1, STALE: -1 };
 
   function signalRows() {
-    const min   = Number($('#sig-min').value) || 0;
-    const only  = $('#sig-set').value;
-    const scope = $('#sig-scope').value;
+    // Thresholds are relative to each price band, computed from the whole
+    // catalogue rather than the filtered view — otherwise raising the price
+    // filter would move the goalposts and re-label the same cards.
+    const bands = E.spreadBands(S.cards);
+
+    const min  = Number($('#sig-min').value) || 0;
+    const q    = S.sigSearch.trim().toLowerCase();
+    const slot = S.sigRarity || 'all';
+    const colr = S.sigColor || 'all';
+    const chaseKeys = ['SEC', 'ALT', 'SP', 'MANGA', 'ULTRA', 'TR'];
 
     // Which cards do I own, and which are earmarked to sell?
     const ownedAny = {}, ownedTrade = {};
@@ -1159,26 +1186,34 @@
 
     const out = [];
     for (const s of liveSets()) {
-      if (only !== 'all' && only !== s.id) continue;
       // Pre-sorted by price descending, so the first entry below the floor
       // means every remaining entry is too.
       const entries = indexFor(s.id).all;
       for (const e of entries) {
         {
           if (e.price < min) break;
-          if (scope === 'owned' && !ownedAny[e.key]) continue;
-          if (scope === 'trade' && !ownedTrade[e.key]) continue;
+
+          if (q && !(e.card.card_name.toLowerCase().includes(q) ||
+                     String(e.card.card_set_id || '').toLowerCase().includes(q))) continue;
+
+          if (slot === 'chase') { if (chaseKeys.indexOf(e.slot) < 0) continue; }
+          else if (slot !== 'all' && e.slot !== slot) continue;
+
+          // Multicolour cards match every colour they contain.
+          if (colr !== 'all' && !hasColor(e.card, colr)) continue;
 
           const sig = E.spreadSignal(e.card);
           if (!sig) continue;
           const age = E.staleness(e.card, null);
 
-          // History is only present for cards already scanned — the tag
-          // degrades to WATCH rather than guessing.
-          const cached = HIST[e.key];
-          const hist = (cached && typeof cached.then !== 'function' && cached.ok) ? cached.h : null;
+          // v2 has no price history: TCGCSV publishes today's build and
+          // discards yesterday's. actionTag already treats a null history as
+          // "unconfirmed" and degrades BUY to WATCH, which is the honest
+          // reading when momentum cannot be checked at all.
+          const hist = null;
 
           const tag = E.actionTag({
+            band: E.bandFor(bands, e.card.market_price),
             sig, age, hist,
             owned: !!ownedAny[e.key],
             ownedTrade: !!ownedTrade[e.key]
@@ -1186,7 +1221,7 @@
 
           out.push({
             entry: e, sig, setId: s.id, hist, tag,
-            market: sig.market, inv: sig.inventory,
+            market: sig.market, inv: sig.inventory, mid: sig.mid,
             ratio: sig.ratio, score: sig.score, age,
             change: hist ? hist.changePct : null,
             rank: tag ? (TAG_RANK[tag.code] || 0) : 0
@@ -1197,100 +1232,46 @@
     return out;
   }
 
-  /**
-   * Fetch 13-day history for the rows on screen so calls can use momentum.
-   * Concurrency-capped — 300 parallel requests would get us rate-limited and
-   * the results are memoised, so a second scan is nearly free.
-   */
-  /**
-   * Scan every row currently in view — no cap.
-   *
-   * The old 60-card limit was over-cautious: one request measures ~135ms, so
-   * at 6 in flight the full $50+ list (342 cards) finishes in about 8 seconds
-   * and the $20+ list (540) in twelve. Results are cached to disk for 12h, so
-   * this is paid once a day rather than once a page load.
-   *
-   * Concurrency stays at 6 deliberately. This is someone else's free API and
-   * there is no reason to open 300 sockets to save four seconds.
-   */
-  const SCAN_CONCURRENCY = 6;
-
-  async function scanTrends(rows) {
-    const btn = $('#sig-scan');
-    if (S.scanning) { S.scanAbort = true; return; }   // second click = stop
-
-    const todo = rows.filter(r => hasHistory(r.entry.card) && !HIST[r.entry.key]);
-    if (!todo.length) { renderSignals(); return; }
-
-    S.scanning = true; S.scanAbort = false;
-    btn.classList.add('scanning');
-    let done = 0;
-    const queue = todo.slice();
-    const total = todo.length;
-
-    // Repaint periodically so calls appear as they resolve instead of the
-    // table sitting frozen for eight seconds.
-    let lastPaint = 0;
-    const tick = () => {
-      btn.textContent = `Stop (${done}/${total})`;
-      if (Date.now() - lastPaint > 1500) { lastPaint = Date.now(); renderSignals(); }
-    };
-
-    async function worker() {
-      while (queue.length && !S.scanAbort) {
-        const r = queue.shift();
-        try { await loadHistoryFor(r.entry.card); } catch (_) {}
-        done++;
-        tick();
-      }
-    }
-    const workers = [];
-    for (let i = 0; i < SCAN_CONCURRENCY; i++) workers.push(worker());
-    await Promise.all(workers);
-
-    S.scanning = false;
-    btn.classList.remove('scanning');
-    btn.textContent = 'Scan trends';
-    persistHist(true);
-    renderSignals();
-  }
 
   function renderSignals() {
+    fillSignalFilters();
     const tbody = $('#sig-tbl tbody');
     const stats = $('#sig-stats');
 
     const rows = signalRows();
-    const fresh = rows.filter(r => !(r.age != null && r.age > E.STALE_DAYS));
-    const tight = fresh.filter(r => r.sig.state === 'TIGHT' || r.sig.state === 'FIRMING');
-    const stale = rows.length - fresh.length;
-    const scanned = rows.filter(r => r.hist).length;
-    // DON!! rows can never be scanned, so counting them as outstanding would
-    // leave the tab permanently reporting work it will never do.
-    const scannable = rows.filter(r => hasHistory(r.entry.card)).length;
-    const pending = Math.max(0, scannable - scanned);
-    const calls = rows.filter(r => r.tag && (r.tag.code === 'BUY' || r.tag.code === 'TRIM' || r.tag.code === 'HOLD'));
+    // v1 dropped rows whose price was over STALE_DAYS old. TCGplayer publishes
+    // no per-card scrape time, so that check cannot run and every row would
+    // count as fresh — reporting "0 too stale" would be a check pretending to
+    // happen. The whole catalogue is one daily build, so freshness is uniform.
+    const bargains = rows.filter(r => r.tag && r.tag.code === 'BUY');
+    const noCheap  = rows.filter(r => r.tag && r.tag.label === 'NO CHEAP COPY');
+    const spread = rows.filter(r => r.sig).length;
 
     stats.innerHTML =
-      stat('Cards tracked', rows.length.toLocaleString(),
-           stale ? `${stale} too stale to read` : 'all fresh') +
-      stat('Tightening', tight.length.toLocaleString(), 'floor within 15% of market, fresh data') +
-      stat('Calls', calls.length.toLocaleString(),
-           scanned ? `from ${scanned} scanned trends` : 'scan trends to generate', 'hero') +
-      stat('Trends loaded', `${scanned}/${scannable}`,
-           rows.length > scannable ? `${rows.length - scannable} DON!! have no history feed`
-                                   : 'momentum confirms supply');
+      stat('Cards tracked', rows.length.toLocaleString(), 'priced in today’s build') +
+      stat('Bargains', bargains.length.toLocaleString(),
+           'cheapest decile for their price band', 'hero') +
+      stat('No cheap copy', noCheap.length.toLocaleString(),
+           'every listing above the sold average') +
+      stat('Priced', spread.toLocaleString(), 'both market and listing available');
 
+    // v2 reads supply only. The momentum half of the old model is gone with
+    // the history feed, so every call rests on the listing-to-market spread
+    // alone — which is why BUY now needs a wider gap to fire than it did when
+    // a rising 13-day trend could corroborate it.
     $('#sig-legend').innerHTML =
-      `<b>MUST BUY</b> supply tightening + price rising, and you do not own it ·
-       <b>HOLD</b> same, but you already own it ·
-       <b>TRIM</b> in your trade binder, cheap copies everywhere and falling ·
-       <b>WATCH</b> tightening but no trend loaded yet ·
-       <b>STALE</b> last priced over ${E.STALE_DAYS} days ago, ignored.
-       ${!pending
-         ? `All ${scannable} scannable rows loaded — cached for 12 hours.`
-         : `<b>${pending}</b> rows still need their 13-day trend before they can produce a
-            call. <b>Scan trends</b> fetches every one of them (about
-            ${Math.max(1, Math.round(pending / SCAN_CONCURRENCY * 0.135))}s), cached for 12 hours.`}`;
+      `<b>BARGAIN</b> listed in the cheapest 10% for its price range, and you do
+         not own it ·
+       <b>TRIM</b> in your trade binder and being undercut that hard ·
+       <b>HOLD</b> you own it and nobody is undercutting you ·
+       <b>NO CHEAP COPY</b> every listing sits above the sold average — hard to
+         buy near market, which is <em>not</em> the same as a buy.
+       Thresholds are per price band, measured from the live catalogue, because
+       the listing-to-market ratio rises with price: at $500+ the median card
+       already lists above market, so one fixed cut-off would just select
+       expensive cards. TCGplayer publishes no price history, so nothing here
+       says which way a price is moving — and a very cheap listing may simply
+       be a damaged copy. Check before you buy.`;
 
     const { by, dir } = S.sort.sig;
     rows.sort((a, b) => {
@@ -1313,15 +1294,14 @@
         <td><span class="tag">${esc(setShort(r.setId))}</span></td>
         <td class="num">${E.money(r.market)}</td>
         <td class="num muted">${E.money(r.inv)}</td>
+        <td class="num muted">${r.mid ? E.money(r.mid) : '—'}</td>
         <td class="num">${E.pct(r.ratio, 0)}</td>
-        <td class="num ${r.change == null ? 'muted' : r.change >= 0 ? 'up' : 'down'}">
-          ${r.change == null ? '—' : (r.change >= 0 ? '+' : '') + E.pct(r.change, 1)}</td>
         <td class="num">${isStale ? '<span class="badge-state st-NORMAL">—</span>'
                                   : `<span class="badge-state st-${r.sig.state}">${r.sig.state}</span>`}</td>
-        <td class="num">${r.tag ? `<span class="call call-${r.tag.code}" title="${esc(r.tag.why)}">${r.tag.label}</span>` : ''}</td>
-        <td class="num muted small">${r.age == null ? '—' : r.age + 'd'}</td>
+        <td class="num">${r.tag ? `<span class="call call-${r.tag.code}" title="${esc(r.tag.why)}">${r.tag.label}</span>`
+                                : '<span class="muted">—</span>'}</td>
       </tr>`;
-    }).join('') || `<tr><td colspan="9" class="muted">Nothing matches those filters.</td></tr>`;
+    }).join('') || `<tr><td colspan="8" class="muted">Nothing matches those filters.</td></tr>`;
 
     $$('#sig-tbl tbody tr[data-key]').forEach(tr => tr.addEventListener('click', () => {
       S.ripSet = tr.dataset.set; S.ripCard = tr.dataset.key; S.ripSearch = '';
@@ -1332,7 +1312,60 @@
 
   /* =========================================================== SETTINGS == */
 
+  /* ---- data source ------------------------------------------------------ */
+
+  const DATA_URL_KEY = 'optcg.dataUrl';
+
+  function renderDataSource() {
+    const input = $('#data-url');
+    if (!input) return;
+    input.value = localStorage.getItem(DATA_URL_KEY) || '';
+
+    const state = $('#src-state');
+    if (!state) return;
+    if (SRC.isMock()) {
+      state.innerHTML = '<span class="tag est">local snapshot</span>';
+      state.title = 'No Worker configured — reading the development snapshot in mockapi/, ' +
+                    'which is not deployed. Set a Worker URL for live prices.';
+    } else {
+      state.innerHTML = '<span class="tag" style="color:var(--up);border-color:#2a6b4a">live</span>';
+      state.title = SRC.base();
+    }
+  }
+
+  async function testDataSource(url) {
+    const msg = $('#data-msg');
+    const clean = (url || '').trim().replace(/\/+$/, '');
+    if (!clean) { msg.innerHTML = '<span class="down">Enter a URL first.</span>'; return false; }
+
+    msg.textContent = 'Testing…';
+    try {
+      // /updated is the cheapest endpoint and proves three things at once: the
+      // Worker is reachable, its CORS headers are right, and it can talk to
+      // TCGCSV. A failure here is why the app would otherwise boot empty.
+      const r = await fetch(clean + '/updated', { cache: 'no-store' });
+      if (!r.ok) {
+        msg.innerHTML = `<span class="down">Worker replied HTTP ${r.status}.</span> ` +
+          (r.status === 403 ? 'Its ALLOWED_ORIGINS does not include this site.' :
+           r.status === 404 ? 'URL reached something, but not this Worker.' : '');
+        return false;
+      }
+      const stamp = (await r.text()).trim();
+      msg.innerHTML = `<span class="up">Connected.</span> ` +
+        `<span class="muted">TCGCSV last rebuilt ${esc(stamp)}.</span>`;
+      return true;
+    } catch (err) {
+      // Nearly always CORS or a typo; "Failed to fetch" alone tells you neither.
+      msg.innerHTML = `<span class="down">Could not reach it.</span> ` +
+        `<span class="muted">${esc(String(err.message || err))} — check the URL is exactly ` +
+        `what wrangler printed, and that the Worker is deployed.</span>`;
+      return false;
+    }
+  }
+
   function renderSettings() {
+    renderDataSource();
+
     // ---- box prices
     $('#box-editor').innerHTML = liveSets().map(s => {
       const est = boxIsEstimate(s.id);
@@ -1344,8 +1377,23 @@
         <input type="number" class="box-in" data-set="${esc(s.id)}" min="0" step="1"
                value="${boxPrice(s.id)}" style="width:110px;text-align:right;
                ${est ? '' : 'border-color:var(--brass);color:var(--brass)'}">
+        <input type="number" class="case-in" data-set="${esc(s.id)}" min="1" max="48" step="1"
+               title="Boxes per sealed case. 12 is standard for OP boosters, but this is not published anywhere, so change it if a product differs."
+               value="${boxesPerCase(s.id)}" style="width:62px;text-align:right;
+               ${S.perCase[s.id] ? 'border-color:var(--brass);color:var(--brass)' : ''}">
       </label>`;
     }).join('');
+
+    $$('.case-in').forEach(inp => inp.addEventListener('change', () => {
+      const v = Math.round(Number(inp.value));
+      // Out of range is a typo, not a real product. Put the field back rather
+      // than storing a number that would silently distort the case verdict.
+      if (!Number.isFinite(v) || v < 1 || v > 48) { renderSettings(); return; }
+      if (v === DEFAULT_PER_CASE) delete S.perCase[inp.dataset.set];
+      else S.perCase[inp.dataset.set] = v;
+      save(KEY.perCase, S.perCase);
+      renderSettings(); renderActive();
+    }));
 
     $$('.box-in').forEach(inp => inp.addEventListener('change', () => {
       const v = parseFloat(inp.value);
@@ -1455,7 +1503,7 @@
     $('#data-info').innerHTML =
       `<b>${S.cards.length.toLocaleString()}</b> cards across <b>${liveSets().length}</b> sets.<br>
        Last fetched: <b>${S.fetchedAt ? new Date(S.fetchedAt).toLocaleString() : 'never'}</b>.<br>
-       Source: <a href="https://optcgapi.com/" target="_blank" rel="noopener">optcgapi.com</a> — English prices only.`;
+       Source: <a href="https://tcgcsv.com/" target="_blank" rel="noopener">tcgcsv.com</a> — TCGplayer English prices, rebuilt daily.`;
 
   }
 
@@ -1472,8 +1520,11 @@
     let changed = false;
 
     if (!live.length) {
-      S.cols.push(Object.assign(C.newCollection('Keeping', 'keep'), { locked: 1 }));
-      S.cols.push(Object.assign(C.newCollection('Trade / Sell', 'trade'), { locked: 1 }));
+      // Fixed ids, not uid(): two devices creating these before their first
+      // sync would otherwise mint four distinct binders and merge would keep
+      // all of them. See C.PERMANENT_ID.
+      S.cols.push(C.newPermanent('keep'));
+      S.cols.push(C.newPermanent('trade'));
       changed = true;
     } else {
       // Migration for binders created before locking existed: the oldest of
@@ -1481,8 +1532,7 @@
       for (const kind of ['keep', 'trade']) {
         const ofKind = live.filter(c => c.kind === kind);
         if (!ofKind.length) {
-          S.cols.push(Object.assign(
-            C.newCollection(kind === 'keep' ? 'Keeping' : 'Trade / Sell', kind), { locked: 1 }));
+          S.cols.push(C.newPermanent(kind));
           changed = true;
         } else if (!ofKind.some(c => c.locked)) {
           ofKind.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
@@ -1493,6 +1543,25 @@
       }
     }
     if (changed) saveCritical(KEY.cols, S.cols);
+  }
+
+  /* Merge duplicate permanent binders, then persist.
+
+     Has to run after a PULL as well as at boot: the duplicates arrive from the
+     sheet, so a boot-only fix would clean this device and then re-import the
+     mess on the next sync. Merged rows are stamped so the collapse propagates
+     to every other device instead of each one fixing itself locally. */
+  function collapsePermanent(reason) {
+    const res = C.dedupePermanent(S.cols, S.items);
+    if (!res.mergedBinders) return 0;
+    S.cols = res.cols;
+    S.items = res.items;
+    saveCritical(KEY.cols, S.cols);
+    saveCritical(KEY.items, S.items);
+    console.info('[optcg] merged duplicate permanent binders', {
+      reason, binders: res.mergedBinders, itemsMoved: res.movedItems });
+    S.binderMerge = { at: Date.now(), binders: res.mergedBinders, items: res.movedItems };
+    return res.mergedBinders;
   }
 
   const liveCols = () => S.cols.filter(c => !c.deleted);
@@ -1506,18 +1575,95 @@
     return c;
   }
 
+  /* The v1 -> v2 key migration, reported rather than assumed.
+
+     A migration that silently half-worked is the worst outcome here, because
+     an unmatched row still displays — it just shows no price and no art, and
+     you would have to notice that yourself. So: say what happened, name the
+     rows that need a human, and stay on screen until dismissed. */
+  function renderMigrationReport() {
+    const host = $('#mig-report');
+    if (!host) return;
+
+    const r = S.migrationReport || load('optcg.migrationReport', null);
+    if (!r || (S.migrationDismissed)) { host.innerHTML = ''; return; }
+
+    const stuck = (r.unmatched || 0) + (r.ambiguous || 0);
+    if (!r.migrated && !stuck) { host.innerHTML = ''; return; }
+
+    host.innerHTML = `
+      <div class="note ${stuck ? 'warn' : ''} small" style="margin-bottom:14px">
+        <b>Collection updated for v2.</b>
+        ${r.migrated ? `${r.migrated} row${r.migrated === 1 ? '' : 's'} repointed to the new
+          card ids and queued for the next Sheets push.` : ''}
+        ${stuck ? `<br><b>${stuck} row${stuck === 1 ? '' : 's'} could not be matched</b> and
+          ${stuck === 1 ? 'was' : 'were'} left exactly as ${stuck === 1 ? 'it was' : 'they were'} —
+          nothing was deleted. ${r.ambiguous ? `${r.ambiguous} matched more than one card. ` : ''}
+          Re-add ${stuck === 1 ? 'it' : 'them'} by hand and delete the old row.
+          ${r.examples && r.examples.length
+            ? `<br><span class="mono muted" style="font-size:11px">${
+                 r.examples.map(esc).join('<br>')}</span>` : ''}`
+          : ' Everything matched.'}
+        <br><button class="btn ghost small" id="mig-dismiss" style="margin-top:8px">Dismiss</button>
+      </div>`;
+
+    const btn = $('#mig-dismiss');
+    if (btn) btn.addEventListener('click', () => {
+      S.migrationDismissed = true;
+      try { localStorage.removeItem('optcg.migrationReport'); } catch (_) {}
+      renderMigrationReport();
+    });
+  }
+
+  /* Cards stranded on a deleted binder.
+
+     Excluding them from the totals is correct but not sufficient — silently
+     dropping value the user entered is its own bug. Surfaced with a one-click
+     move into Keeping so they can be recovered rather than merely hidden. */
+  function renderStranded(rows) {
+    const host = $('#stranded-report');
+    if (!host) return;
+    if (!rows || !rows.length) { host.innerHTML = ''; return; }
+
+    host.innerHTML = `
+      <div class="note warn small" style="margin-bottom:14px">
+        <b>${rows.length === 1 ? 'A card' : rows.length + ' cards'} lost
+        ${rows.length === 1 ? 'its' : 'their'} binder.</b>
+        This happens when one device deletes a binder while another adds to it.
+        They are not counted in the totals below, because they are not in any
+        binder — but nothing has been deleted.
+        <br><button class="btn small" id="stranded-fix" style="margin-top:8px">
+          Move ${rows.length === 1 ? 'it' : 'them'} to Keeping</button>
+      </div>`;
+
+    const btn = $('#stranded-fix');
+    if (btn) btn.addEventListener('click', () => {
+      const keep = liveCols().find(c => c.kind === 'keep');
+      if (!keep) return;
+      for (const it of rows) { it.colId = keep.id; it.updatedAt = Date.now(); }
+      persistCollection();
+      renderCollection();
+    });
+  }
+
   function renderCollection() {
     ensureCollections();
     const col = currentCol();
     renderBinders();
     renderSyncPanel();
+    renderMigrationReport();
 
     // ---- headline numbers across every binder
-    const all = C.valueOf(C.live(S.items), priceForKey);
+    // Only cards in a binder that still exists. A sync race can strand rows on
+    // a deleted binder: invisible in every binder, yet still inflating the
+    // headline total, so the number disagreed with everything you could see.
+    const placed = C.livePlaced(S.items, S.cols);
+    renderStranded(C.orphans(S.items, S.cols));
+    const all = C.valueOf(placed, priceForKey);
     const keepIds  = liveCols().filter(c => c.kind === 'keep').map(c => c.id);
     const tradeIds = liveCols().filter(c => c.kind === 'trade').map(c => c.id);
-    const keep  = C.valueOf(C.live(S.items).filter(i => keepIds.indexOf(i.colId) > -1), priceForKey);
-    const trade = C.valueOf(C.live(S.items).filter(i => tradeIds.indexOf(i.colId) > -1), priceForKey);
+    const keep  = C.valueOf(placed.filter(i => keepIds.indexOf(i.colId) > -1), priceForKey);
+    const trade = C.valueOf(placed.filter(i => tradeIds.indexOf(i.colId) > -1), priceForKey);
 
     // Trade stock valued at what a vendor would actually give for it. Each
     // binder carries its own rate because not every buyer offers the same.
@@ -1547,6 +1693,21 @@
     renderColTable(col);
   }
 
+  /* Show the live box price as the cost placeholder for the selected set. */
+  function syncOpenCostHint() {
+    const sel = $('#op-set'), cost = $('#op-cost');
+    if (!sel || !cost) return;
+    const boxes = Math.max(1, parseInt(($('#op-boxes') || {}).value, 10) || 1);
+    const live = sealedPrice(sel.value, 'box');
+    cost.placeholder = live ? Math.round(live * boxes) : '150';
+    const hint = $('#op-cost-hint');
+    if (hint) {
+      hint.textContent = live
+        ? `market is ${E.money(live)}/box` + (boxes > 1 ? ` · ${E.money(live * boxes)} for ${boxes}` : '')
+        : 'no live box price for this set';
+    }
+  }
+
   /* ---- rip scoreboard ---------------------------------------------------- */
   function renderScoreboard() {
     const sel = $('#op-set');
@@ -1554,10 +1715,18 @@
       sel.innerHTML = liveSets().map(s =>
         `<option value="${esc(s.id)}">${esc(s.short)} · ${esc(s.name)}</option>`).join('');
       sel.dataset.filled = '1';
+      // Prefill the cost from the live box price so logging an opening is two
+      // fields instead of three. Only ever a PLACEHOLDER, never a value: what
+      // you actually paid is the whole point of this number, and quietly
+      // filling in market price would turn the scoreboard into a comparison
+      // of market against itself.
+      sel.addEventListener('change', syncOpenCostHint);
     }
+    syncOpenCostHint();
 
     const sb = C.scoreboard(S.opens, S.items, priceForKey, setShort,
-                            id => !!D.SETS.find(s => s.id === id));
+                            id => !!D.SETS.find(s => s.id === id),
+                            key => (S.byKey[key] || {}).set_id || '');
     const body = $('#score-body');
     if (!body) return;
 
@@ -1689,7 +1858,7 @@
     const sets = browseSets();
     if (!S.addSet || !sets.some(s => s.id === S.addSet)) {
       const boosters = liveSets();
-      S.addSet = boosters.length ? boosters[boosters.length - 1].id : (sets[0] && sets[0].id);
+      S.addSet = boosters.length ? defaultSetId(boosters) : (sets[0] && sets[0].id);
     }
 
     const sel = $('#add-set');
@@ -2035,6 +2204,9 @@
       S.items = C.mergeRows(S.items, remote.items);
       S.opens = C.mergeRows(S.opens, remote.opens);
       save(KEY.cols, S.cols); save(KEY.items, S.items); save(KEY.opens, S.opens);
+      // The sheet is where duplicates come from, so collapse after every pull.
+      ensureCollections();
+      collapsePermanent('pull');
       setSync('ok', 'synced');
       if (!silent) renderCollection();
       else if (S.tab === 'collection') renderCollection();
@@ -2170,13 +2342,6 @@
     wireCollapsibles();
     window.scrollTo({ top: 0, behavior: 'smooth' });
 
-    // Calls are the point of the Signals tab, and they need trend data. Making
-    // that a button press meant the tab looked broken until you found it.
-    // Scan once per session; the button stays for topping up after a filter change.
-    if (tab === 'signals' && !S.sigAutoScanned) {
-      S.sigAutoScanned = true;
-      scanTrends(signalRows());
-    }
   }
 
   /**
@@ -2262,9 +2427,15 @@
     });
 
     $('#sig-min').addEventListener('change', renderSignals);
-    $('#sig-set').addEventListener('change', renderSignals);
-    $('#sig-scope').addEventListener('change', renderSignals);
-    $('#sig-scan').addEventListener('click', () => scanTrends(signalRows()));
+    let sigTimer;
+    $('#sig-search').addEventListener('input', e => {
+      const v = e.target.value;
+      // Debounced like the rip search: 333 rows re-rank on every keystroke.
+      clearTimeout(sigTimer);
+      sigTimer = setTimeout(() => { S.sigSearch = v; renderSignals(); }, 180);
+    });
+    $('#sig-rarity').addEventListener('change', e => { S.sigRarity = e.target.value; renderSignals(); });
+    $('#sig-colour').addEventListener('change', e => { S.sigColor = e.target.value; renderSignals(); });
 
     $$('#sets-tbl th.sortable').forEach(th => th.addEventListener('click', () => {
       const by = th.dataset.sort;
@@ -2279,7 +2450,41 @@
 
     $('#pr-profile').addEventListener('change', renderSettings);
     $('#reset-boxes').addEventListener('click', () => {
-      S.boxes = {}; save(KEY.boxes, S.boxes); renderSettings(); renderActive();
+      S.boxes = {}; S.perCase = {};
+      save(KEY.boxes, S.boxes); save(KEY.perCase, S.perCase);
+      renderSettings(); renderActive();
+    });
+
+    $('#data-test').addEventListener('click', () => testDataSource($('#data-url').value));
+
+    $('#data-save').addEventListener('click', async () => {
+      const url = $('#data-url').value.trim().replace(/\/+$/, '');
+      const msg = $('#data-msg');
+
+      // Clearing the field is a legitimate action — it drops back to the local
+      // snapshot, which is how development works.
+      if (!url) {
+        localStorage.removeItem(DATA_URL_KEY);
+        msg.innerHTML = '<span class="muted">Cleared. Using the local snapshot.</span>';
+        renderDataSource();
+        return;
+      }
+      // Refuse to save something that does not work. Saving a bad URL and
+      // reloading would empty the app and look like data loss.
+      if (!(await testDataSource(url))) return;
+
+      localStorage.setItem(DATA_URL_KEY, url);
+      msg.textContent = 'Saved. Reloading card data…';
+      try {
+        // The cached rows came from the old source; force a full refetch.
+        try { localStorage.removeItem(KEY.cards); } catch (_) {}
+        await fetchCards(true);
+        invalidate(); renderDataSource(); renderSettings(); renderActive();
+        msg.innerHTML = `<span class="up">Loaded ${S.cards.length.toLocaleString()} cards ` +
+                        `and ${S.products.length} sealed products.</span>`;
+      } catch (err) {
+        msg.innerHTML = `<span class="down">Saved, but loading failed: ${esc(err.message)}</span>`;
+      }
     });
     $('#reset-rates').addEventListener('click', () => {
       const v = $('#pr-profile').value || '';
@@ -2308,10 +2513,60 @@
     $('#retry').addEventListener('click', boot);
   }
 
-  function fillSetPickers() {
-    const opts = liveSets().map(s => `<option value="${esc(s.id)}">${esc(s.short)} · ${esc(s.name)}</option>`).join('');
-    $('#sig-set').innerHTML = `<option value="all">All sets</option>` + opts;
+  /* Rarity and colour options for Signals, counted against the price floor
+     currently in force so the numbers match what the table will actually show.
+     Each list is counted WITHIN the other's selection, same as Rip vs Buy. */
+  function fillSignalFilters() {
+    const raritySel = $('#sig-rarity'), colourSel = $('#sig-colour');
+    if (!raritySel || !colourSel) return;
+
+    const min = Number(($('#sig-min') || {}).value) || 0;
+    const chaseKeys = ['SEC', 'ALT', 'SP', 'MANGA', 'ULTRA', 'TR'];
+    const pool = [];
+    for (const s of liveSets()) {
+      for (const e of indexFor(s.id).all) {
+        if (e.price < min) break;
+        pool.push(e);
+      }
+    }
+
+    const slot = S.sigRarity || 'all', colr = S.sigColor || 'all';
+
+    const forRarity = colr === 'all' ? pool : pool.filter(e => hasColor(e.card, colr));
+    const rCounts = {};
+    for (const e of forRarity) rCounts[e.slot] = (rCounts[e.slot] || 0) + 1;
+    const chaseCount = chaseKeys.reduce((n, k) => n + (rCounts[k] || 0), 0);
+
+    const rOpts = [`<option value="all">All rarities (${forRarity.length})</option>`];
+    if (chaseCount) rOpts.push(`<option value="chase">Chase only (${chaseCount})</option>`);
+    for (const sl of D.SLOTS) {
+      if (!rCounts[sl.key]) continue;
+      rOpts.push(`<option value="${esc(sl.key)}">${esc(sl.label)} (${rCounts[sl.key]})</option>`);
+    }
+    raritySel.innerHTML = rOpts.join('');
+    raritySel.value = slot;
+    // Raising the price floor can empty a rarity — fall back rather than
+    // showing an empty table with a filter that looks active.
+    if (raritySel.value !== slot) { S.sigRarity = 'all'; raritySel.value = 'all'; }
+
+    const forColour = slot === 'all' ? pool
+      : slot === 'chase' ? pool.filter(e => chaseKeys.indexOf(e.slot) > -1)
+      : pool.filter(e => e.slot === slot);
+    const cCounts = {};
+    for (const e of forColour) {
+      for (const c of D.COLORS) if (hasColor(e.card, c)) cCounts[c] = (cCounts[c] || 0) + 1;
+    }
+    const cOpts = [`<option value="all">All colours (${forColour.length})</option>`];
+    for (const c of D.COLORS) {
+      if (!cCounts[c]) continue;
+      cOpts.push(`<option value="${esc(c)}">${esc(c)} (${cCounts[c]})</option>`);
+    }
+    colourSel.innerHTML = cOpts.join('');
+    colourSel.value = colr;
+    if (colourSel.value !== colr) { S.sigColor = 'all'; colourSel.value = 'all'; }
   }
+
+  function fillSetPickers() { /* Signals no longer has a set picker. */ }
 
   /* A pending write must not die with the tab. sendBeacon survives unload where
      fetch does not. */
@@ -2328,6 +2583,60 @@
 
   /* ================================================================ BOOT == */
 
+  /* Repoint v1 collection rows onto productIds, once, on the first v2 boot.
+
+     Runs after the cards are loaded because it needs them to match against,
+     and before any render, so nothing ever paints a v1 key as a $0 unknown
+     card. Rows that cannot be matched are LEFT ALONE and surfaced — a wrong
+     match is worse than an unmigrated row, because the row still looks fine
+     while pointing at the wrong card.
+
+     migrateKeys() stamps updatedAt on every row it repoints, which is exactly
+     what the sync treats as dirty, so the corrected keys ride up to the sheet
+     on the next push. Without that this device would be migrated while every
+     other one kept pulling the old keys back down. Row `id` is unchanged, so
+     the sheet updates rows in place rather than duplicating them. */
+  function runKeyMigration() {
+    const v1 = S.items.filter(it => C.isV1Key(it.key));
+    if (!v1.length) return;
+
+    const res = C.migrateKeys(S.items, S.cards);
+    S.items = res.items;
+    S.migrationReport = {
+      at: Date.now(),
+      migrated: res.migrated,
+      unmatched: res.unmatched.length,
+      ambiguous: res.ambiguous.length,
+      examples: res.unmatched.slice(0, 8).map(it => it.key)
+    };
+
+    if (res.migrated) persistCollection();
+    save('optcg.migrationReport', S.migrationReport);
+    console.info('[optcg] collection key migration:', S.migrationReport);
+  }
+
+  /* Build the per-set indexes during idle time instead of on first use.
+
+     Measured: the first visit to Signals cost 67ms because it built all 22 set
+     indexes synchronously, then 7ms for every visit after — so it was one-time
+     work landing at the worst possible moment, mid-tap. On a phone that is the
+     difference between a tab that opens and a tab that hitches.
+
+     One set per idle callback, so a slow device never gets a long task; if
+     requestIdleCallback is missing the whole thing is simply skipped and the
+     old lazy path still works. */
+  function prewarmIndexes() {
+    if (typeof requestIdleCallback !== 'function') return;
+    const queue = liveSets().map(s => s.id);
+    const step = deadline => {
+      while (queue.length && (deadline.timeRemaining() > 4 || deadline.didTimeout)) {
+        indexFor(queue.shift());
+      }
+      if (queue.length) requestIdleCallback(step, { timeout: 2000 });
+    };
+    requestIdleCallback(step, { timeout: 2000 });
+  }
+
   async function boot() {
     $('#boot').classList.remove('hidden');
     $('#boot-error').classList.add('hidden');
@@ -2340,6 +2649,8 @@
         fetchCards(true).then(() => { invalidate(); renderActive(); }).catch(() => {});
       }
       ensureCollections();
+      collapsePermanent('boot');
+      runKeyMigration();
       compactTombstones();
       fillSetPickers();
       wire();
@@ -2352,10 +2663,22 @@
       // Sheets is the source of truth across devices, so reconcile on every
       // load. Render first so a slow sheet never blocks the app.
       if (S.syncUrl) pullNow(true);
+
+      prewarmIndexes();
     } catch (err) {
       $('#boot').classList.add('hidden');
       $('#boot-error').classList.remove('hidden');
-      $('#boot-error-msg').textContent = err.message;
+
+      // The overwhelmingly likely cause on a fresh deploy is no Worker URL:
+      // mockapi/ is a dev snapshot and is not published, so every fetch 404s.
+      // Saying "HTTP 404" there would send you debugging the wrong thing.
+      const noSource = SRC.isMock();
+      $('#boot-error-msg').innerHTML = noSource
+        ? 'No data source is configured.<br><span class="small muted">This app reads ' +
+          'TCGplayer prices through a small Cloudflare Worker. Deploy <code>worker/worker.js</code>, ' +
+          'then open Settings → Data source and paste its URL. See DEPLOY.md.</span>'
+        : esc(err.message) + '<br><span class="small muted">Data source: ' +
+          esc(SRC.base()) + '</span>';
     }
   }
 

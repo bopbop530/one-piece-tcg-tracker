@@ -134,8 +134,15 @@ const OQ_ENGINE = (function (D) {
    *
    * Anything less than this and clicking an expensive variant silently
    * resolves to the cheap card that shares its id.
+   *
+   * v2 UPDATE: none of that is needed any more. TCGplayer's productId is a
+   * genuine primary key — verified unique across all 6,798 cards in all 84
+   * groups, zero collisions — so the composite is only kept as a fallback for
+   * v1 rows still sitting in localStorage or the sheet, which is what the
+   * collection migration reads.
    */
   function cardKey(card) {
+    if (card.id != null && card.id !== '') return String(card.id);
     return card.set_id + '|' + (card.card_image_id || card.card_set_id) + '|' + card.card_name;
   }
 
@@ -440,14 +447,49 @@ const OQ_ENGINE = (function (D) {
     const ratio = inv / mkt;               // 1.0 = floor has met the market
     const discount = 1 - ratio;            // how far below market you can buy
 
+    /* v2: the mid price separates real supply from one cheap outlier.
+
+       `low` is a single listing and can be anybody's mispriced copy. `mid` is
+       the middle of the listings, so when low sits far under mid the cheap
+       copy is an outlier, not the market — OP-16 "Zehahahahaha!" reads low
+       $106 against mid $154 on a $128 market, which looks like a discount and
+       is really one seller. Comparing mid to market asks the honest question:
+       what does the BODY of the listings think this is worth? */
+    const mid = c.mid_price;
+    const midRatio = (mid && mid > 0) ? mid / mkt : null;
+    // A low far beneath the mid is one listing, not depth.
+    const thinLow = (mid && mid > 0) ? (inv / mid) < 0.75 : false;
+
+    /* A floor several times market is not a signal, it is a junk listing.
+
+       92 cards (1.5%) sit at 3x or more; the worst is Riku Doldo III, a $4.76
+       common whose only listing is $2,608 — and its MID is the same number,
+       which is the tell: there is exactly one copy for sale and it is priced
+       for nobody. Ranking these produces confident nonsense at the top of
+       every ratio sort.
+
+       3x is the cut because the most extreme legitimate band behaviour
+       measured was p90 = 2.68 among $500+ cards, so this sits just above the
+       real world rather than clipping it. */
+    const absurd = ratio >= ABSURD_RATIO;
+
+    /* DRY is a state v1 could not express. When the CHEAPEST copy on the
+       market is above the sold average, there is nothing left to buy at a
+       sensible price — OP-16 Sakazuki (Manga) sells for $1,224 and the
+       cheapest listing is $1,696. That is categorically different from
+       "tightening", and lumping the two together is what made the call list
+       59% of the board. */
     let state, score;
-    if (ratio >= 0.95)      { state = 'TIGHT';   score = 9; }
+    if (ratio >= 1.0)       { state = 'DRY';     score = 10; }
+    else if (ratio >= 0.95) { state = 'TIGHT';   score = 9; }
     else if (ratio >= 0.85) { state = 'FIRMING'; score = 7; }
     else if (ratio >= 0.70) { state = 'NORMAL';  score = 5; }
     else if (ratio >= 0.50) { state = 'SOFT';    score = 3; }
     else                    { state = 'LOOSE';   score = 1; }
 
-    return { ratio, discount, state, score, inventory: inv, market: mkt };
+    return { ratio, discount, state: absurd ? 'NOFLOOR' : state,
+             score: absurd ? 0 : score, inventory: inv, market: mkt,
+             mid: mid || null, midRatio, thinLow, absurd };
   }
 
   /**
@@ -464,6 +506,71 @@ const OQ_ENGINE = (function (D) {
    * dressed up as a signal.
    */
   const STALE_DAYS = 30;
+
+  /* No fixed ratio can work here, and two failed attempts proved it.
+
+     The listing-to-market ratio is strongly PRICE-DEPENDENT. Measured across
+     6,211 priced cards:
+
+       band        n     p10    p50    p90
+       $5-20     806    0.65   0.87   1.22
+       $20-100   568    0.72   0.94   1.66
+       $100-500  267    0.73   0.97   1.80
+       $500+     134    0.86   1.13   2.68
+
+     A $500+ card whose cheapest copy sits at 1.13x market is at its band's
+     MEDIAN — perfectly ordinary. A $5 card at the same ratio is an outlier.
+     Any single threshold therefore just selects for expensive cards: 0.95
+     flagged 195 of 333 rows, and 1.0 flagged 129, because at $100+ half the
+     band already sits above market.
+
+     So the thresholds are computed from the loaded data at runtime, per band,
+     and a card is judged only against its own peers. That self-calibrates as
+     the market moves and, by construction, keeps the shortlist near a tenth of
+     the rows instead of a third. */
+  /* Above this the cheapest listing is not a price, it is somebody's
+     placeholder. See spreadSignal. */
+  const ABSURD_RATIO = 3;
+
+  const PRICE_BANDS = [0, 5, 20, 100, 500, Infinity];
+
+  function percentile(sorted, p) {
+    if (!sorted.length) return null;
+    return sorted[Math.floor((sorted.length - 1) * p)];
+  }
+
+  /**
+   * Per-band ratio percentiles, computed from whatever cards are loaded.
+   * Bands with too few cards to be meaningful are left null and the caller
+   * falls back to reporting nothing rather than inventing a threshold.
+   */
+  function spreadBands(cards) {
+    const buckets = PRICE_BANDS.slice(0, -1).map((min, i) => ({
+      min, max: PRICE_BANDS[i + 1], ratios: []
+    }));
+
+    for (const c of cards) {
+      const card = c.card || c;
+      const mkt = card.market_price, low = card.inventory_price;
+      if (!mkt || mkt <= 0 || low == null || low <= 0) continue;
+      const b = buckets.find(x => mkt >= x.min && mkt < x.max);
+      if (b) b.ratios.push(low / mkt);
+    }
+
+    return buckets.map(b => {
+      const sorted = b.ratios.sort((x, y) => x - y);
+      // Under ~20 samples a decile is noise, not a threshold.
+      const enough = sorted.length >= 20;
+      return {
+        min: b.min, max: b.max, n: sorted.length,
+        p10: enough ? percentile(sorted, 0.10) : null,
+        p90: enough ? percentile(sorted, 0.90) : null
+      };
+    });
+  }
+
+  const bandFor = (bands, market) =>
+    (bands || []).find(b => market >= b.min && market < b.max) || null;
 
   function actionTag(o) {
     const sig = o.sig, age = o.age, h = o.hist;
@@ -484,9 +591,61 @@ const OQ_ENGINE = (function (D) {
                why: 'Price has not moved for 13 straight days — almost certainly not repriced rather than genuinely stable.' };
     }
 
+    /* SUPPLY-ONLY LADDER — the v2 path.
+
+       TCGplayer publishes no price history, so momentum can never confirm a
+       call. v1 required both (tight supply AND a rising trend); keeping that
+       rule with h permanently null made BUY, HOLD, TRIM and AVOID unreachable
+       and left the tab reporting "0 calls" forever while the legend still
+       advertised them.
+
+       So supply carries the call alone, and the bar is raised to compensate.
+       `tight` at 0.85 was a shortlist threshold when a trend had to agree with
+       it; on its own it is too loose to act on. CALL_RATIO is the point where
+       the cheapest copy on the market has essentially caught up with the sold
+       average — there is no cheap copy left to buy, which is a supply fact and
+       needs no trend to be true. */
     if (!h) {
-      if (tight) return { code: 'WATCH', label: 'WATCH',
-                          why: 'Cheap copies thinning out. Scan trends to confirm it is moving.' };
+      /* THE BUY SIGNAL IS A LOW RATIO, NOT A HIGH ONE.
+
+         v1 called "cheapest copy near market" a buy, because a rising 13-day
+         trend confirmed the price was climbing to meet the listings. With no
+         history that confirmation is gone, and the signal inverts: a cheapest
+         listing far ABOVE the sold average means every copy on sale is priced
+         over what people actually pay — that is a reason not to buy, not a
+         reason to buy.
+
+         What the spread alone genuinely supports is the opposite tail: a copy
+         listed well BELOW what the card has been selling for. Trafalgar Law
+         (119) (Manga) sells at $715 with a copy listed at $300. That is a fact
+         about today's board and needs no trend to be actionable. */
+      // No usable floor -> no verdict. Silence beats a confident wrong answer.
+      if (sig.absurd) return null;
+
+      const band = o.band;
+      if (!band || band.p10 == null) return null;   // no basis, so say nothing
+
+      const pct = Math.round(sig.ratio * 100);
+      const cheap = sig.ratio <= band.p10;          // bottom decile of its band
+      const scarce = band.p90 != null && sig.ratio >= band.p90;
+
+      if (o.ownedTrade && cheap && !sig.thinLow) {
+        return { code: 'TRIM', label: 'TRIM',
+                 why: `You hold this to sell and copies are listed at ${pct}% of market — among the most undercut in its price range, and it is not one stray listing.` };
+      }
+      if (cheap && !o.owned) {
+        return { code: 'BUY', label: 'BARGAIN',
+                 why: `Listed at ${pct}% of what it has been selling for — the cheapest decile for cards in this price range.` +
+                      (sig.thinLow ? ' Only one cheap copy, well under the rest, so check its condition before trusting it.' : '') };
+      }
+      if (scarce && o.owned) {
+        return { code: 'HOLD', label: 'HOLD',
+                 why: `Nobody is undercutting you — the cheapest copy listed is ${pct}% of market, the top decile for this price range.` };
+      }
+      if (scarce) {
+        return { code: 'WATCH', label: 'NO CHEAP COPY',
+                 why: `Every copy on sale is above the sold average (cheapest is ${pct}%). Hard to buy near market — not a bargain, and with no price history there is nothing to say it is climbing.` };
+      }
       return null;
     }
 
@@ -514,6 +673,12 @@ const OQ_ENGINE = (function (D) {
   }
 
   /** Days since this card's price was last scraped. Stale data lies. */
+  /* v2 NOTE: this returns null for every card from TCGCSV, because TCGplayer
+     publishes no per-card scrape time — only a whole-catalogue build stamp.
+     It is kept because actionTag() and the tests still exercise the guard, and
+     because it degrades correctly: a null age means "cannot tell", not "fresh".
+     Anything user-facing that promised a STALE verdict has been removed rather
+     than left claiming a check that can no longer run. */
   function staleness(card, today) {
     if (!card.date_scraped) return null;
     const then = new Date(card.date_scraped + 'T00:00:00');
@@ -585,7 +750,7 @@ const OQ_ENGINE = (function (D) {
     parseVariants, classify, cardKey, rarityBadge,
     buildSetIndex, evaluate, chaseConcentration, configFit,
     perPackProbability, ripVsBuy,
-    spreadSignal, staleness, parseHistory, actionTag, STALE_DAYS,
+    spreadSignal, staleness, parseHistory, actionTag, STALE_DAYS, spreadBands, bandFor, PRICE_BANDS, ABSURD_RATIO,
     money, pct, odds
   };
 })(OQ_DATA);

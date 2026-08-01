@@ -199,6 +199,11 @@ nav.tabs button[aria-selected="true"] { background: var(--sea); color: #04121d; 
 .tag.est { color: var(--warn); border-color: #6b4a18; background: #2a1e0c; }
 
 .badge-state { font: 700 10px/1.6 var(--mono); padding: 2px 8px; border-radius: 999px; letter-spacing: .06em; }
+/* Nothing listed below the sold average. Deliberately NOT green — it is not a
+   buy, it means you cannot buy near market. */
+.st-DRY     { background: #2a1e0c; color: var(--warn); border: 1px solid #6b4a18; }
+/* The only listings are multiples of market: a placeholder, not a price. */
+.st-NOFLOOR { background: #1b2436; color: var(--ink-3); border: 1px dashed var(--line); }
 .st-TIGHT   { background: #10301f; color: #4fe3a0; border: 1px solid #2a6b4a; }
 .st-FIRMING { background: #13291b; color: #8fd67a; border: 1px solid #3a6b2a; }
 .st-NORMAL  { background: #1b2436; color: var(--ink-2); border: 1px solid var(--line); }
@@ -216,6 +221,11 @@ select, input[type="text"], input[type="number"], input[type="search"] {
   background: var(--bg); color: var(--ink);
   border: 1px solid var(--line); border-radius: var(--r-s);
   font: 14px/1.3 var(--sans); outline: 0; transition: border-color .14s;
+  /* A <select> ignores the line-height from the font shorthand and lays out at
+     `normal`, which makes it 41px against an input's 38px. In a row of
+     controls that is a visibly taller box; fixing the height makes every
+     control in a form line up regardless of which element it is. */
+  height: 38px; box-sizing: border-box;
 }
 select:focus, input:focus { border-color: var(--sea); }
 input[type="range"] { width: 100%; accent-color: var(--sea); }
@@ -615,4 +625,35 @@ footer.foot { border-top: 1px solid var(--line-soft); margin-top: 40px; padding:
   .fld > span { font-size: 10px; margin-bottom: 4px; }
   label.fld { margin-bottom: 10px; }
   .note { padding: 9px 11px; font-size: 11.5px; }
+
+  /* ---- touch targets -----------------------------------------------------
+     Measured at 412px: form controls were 38px, in-table links 23px, inline
+     links 16px. Apple and Material both put the floor at 44px, and these are
+     being hit with a thumb on a 6.9" phone. */
+  select, input[type="text"], input[type="number"], input[type="search"] {
+    height: 44px; font-size: 16px;   /* 16px also stops iOS zooming on focus */
+  }
+  button.btn { min-height: 44px; }
+  button.btn.small { min-height: 38px; }
+  /* An <a class="btn"> has no intrinsic height, so it collapsed to its line
+     box — the "View on TCGplayer" button measured 23px. inline-flex gives it
+     one; the rule has to cover links anywhere, not just inside tables. */
+  a.btn { min-height: 44px; display: inline-flex; align-items: center;
+          justify-content: center; padding: 0 16px; }
+  td a.btn, a.btn.small { min-height: 38px; padding: 0 14px; }
+  /* Tab bar was 36px and it is the most-tapped control in the app. */
+  nav.tabs button { min-height: 42px; }
+
+  /* A panel title that repeats what the tab already says is 46px of nothing.
+     "Pick your chase" sits directly under a tab labelled "Rip vs Buy", above
+     a Set picker and a search box — the screen explains itself. */
+  .hide-mobile { display: none !important; }
+
+  /* ---- vertical budget ---------------------------------------------------
+     The filter stack cost 358px — 39% of the screen — before a single card
+     appeared, because four controls each sat on their own row. Rarity and
+     colour are short selects and read fine side by side, which buys back a
+     whole row without shrinking anything. */
+  .filter-2up { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .filter-2up > label.fld { margin-bottom: 10px; }
 }

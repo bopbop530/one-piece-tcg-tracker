@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<!--
+  OPTCG QUANT — engine tests
+  ==========================
+  Open tests.html in a browser. No build, no dependencies, no network.
+
+  Every test here guards a bug that ACTUALLY HAPPENED during development, and
+  each one is named after it. This is not coverage theatre — it is a list of
+  the ways this codebase has already been wrong once:
+
+    - card ids that looked unique and were not (three separate times)
+    - variant tags that silently dropped an $8,490 card into the wrong slot
+    - a validation check that only fired in one direction
+    - a column sorted by the wrong field
+    - a flat price line that meant "not repriced", not "stable"
+
+  Add a test here whenever something breaks. The point is that it cannot
+  break the same way twice.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OPTCG Quant — engine tests</title>
+<link rel="stylesheet" href="styles.css?v=1.18.1">
+<style>
+  .wrap { max-width: 900px; padding-top: 24px; }
+  .suite { margin-bottom: 20px; }
+  .suite h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase;
+              color: var(--ink-2); margin: 0 0 10px; }
+  .t { display: flex; gap: 10px; padding: 6px 10px; border-radius: 6px;
+       font: 12.5px/1.5 var(--mono); align-items: baseline; }
+  .t.pass { color: var(--ink-2); }
+  .t.fail { background: rgba(255,95,109,.10); border: 1px solid #6b2a2a; color: #ffb4b4; }
+  .t .mark { flex: none; font-weight: 800; }
+  .t.pass .mark { color: var(--up); }
+  .t.fail .mark { color: var(--down); }
+  .t .why { display: block; color: var(--down); margin-top: 4px; }
+  .summary { padding: 16px 18px; border-radius: 10px; margin-bottom: 22px;
+             font: 700 16px/1.4 var(--sans); }
+  .summary.ok  { background: rgba(53,208,138,.12); border: 1px solid #2a6b4a; color: var(--up); }
+  .summary.bad { background: rgba(255,95,109,.12); border: 1px solid #6b2a2a; color: var(--down); }
+  .summary span { display: block; font: 400 13px/1.5 var(--sans); color: var(--ink-2); margin-top: 5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header style="padding:0 0 20px">
+    <h1 style="margin:0;font-size:22px">Engine tests</h1>
+    <p class="small muted" style="margin:6px 0 0">
+      Pure-function tests over <code>engine.js</code> and <code>collection.js</code>.
+      Every case is a regression guard for a bug that already happened.
+    </p>
+  </header>
+  <div id="summary"></div>
+  <div id="out"></div>
+</div>
+
+<script src="data.js?v=1.18.1"></script>
+<script src="engine.js?v=1.18.1"></script>
+<script src="collection.js?v=1.18.1"></script>
+<script>
+(function (D, E, C) {
+  'use strict';
+
+  /* ---------------------------------------------------------- harness --- */
+  const results = [];
+  let suite = '';
+  const describe = name => { suite = name; };
+
+  function it(name, fn) {
+    try {
+      fn();
+      results.push({ suite, name, pass: true });
+    } catch (err) {
+      results.push({ suite, name, pass: false, why: err.message });
+    }
+  }
+  function eq(actual, expected, label) {
+    const a = JSON.stringify(actual), b = JSON.stringify(expected);
+    if (a !== b) throw new Error(`${label || 'expected'}: got ${a}, wanted ${b}`);
+  }
+  function ok(cond, label) { if (!cond) throw new Error(label || 'expected truthy'); }
+  function near(actual, expected, tol, label) {
+    if (Math.abs(actual - expected) > tol) {
+      throw new Error(`${label || 'expected'}: got ${actual}, wanted ~${expected}`);
+    }
+  }
+
+  /* Minimal card shaped like the API returns. */
+  function card(o) {
+    return Object.assign({
+      card_set_id: 'OP01-001', card_image_id: 'OP01-001', card_name: 'Test',
+      set_id: 'OP-01', set_name: 'Romance Dawn', rarity: 'C',
+      market_price: 1, inventory_price: 1, card_image: '', date_scraped: null
+    }, o);
+  }
+  const priceOf = c => c.market_price || 0;
+
+
+  /* ==================================== supply-only action tags (v2) ====== */
+  describe('actionTag with no history — the buy signal is the CHEAP tail');
+
+  /* Three regressions live in this suite, all of which shipped:
+       1. v1 needed tight supply AND a rising trend. History gone -> hist always
+          null -> BUY/HOLD/TRIM unreachable, "Calls 0", legend still promising them.
+       2. Fixed bar at 0.95 called 195 of 333 rows.
+       3. Fixed bar at 1.0 called 129 — because the ratio scales with price, so
+          any fixed cut-off just selects expensive cards.
+     A call is now the bottom decile OF ITS OWN PRICE BAND. */
+
+  const band = { min: 100, max: 500, n: 267, p10: 0.73, p90: 1.80 };
+  const sig = (ratio, mid) => ({
+    ratio, state: 'X', inventory: ratio, market: 1,
+    mid: mid == null ? ratio : mid,
+    thinLow: mid == null ? false : (ratio / mid) < 0.75
+  });
+  const tagOf = (ratio, extra) =>
+    E.actionTag(Object.assign({ sig: sig(ratio), age: null, hist: null, band }, extra || {}));
+
+  it('a listing well below the sold average is the buy', () => {
+    // Trafalgar Law (119) (Manga): $715 market, $300 listed.
+    eq(tagOf(0.42).code, 'BUY');
+    eq(tagOf(0.42).label, 'BARGAIN');
+  });
+
+  it('a listing ABOVE market is never a buy', () => {
+    // The bug this replaces: 1.39 used to read MUST BUY. In the $100-500 band
+    // it is merely unremarkable (p90 is 1.80), so the honest answer is silence.
+    const ordinary = tagOf(1.39);
+    ok(!ordinary || ordinary.code !== 'BUY', 'above-market must never be a buy');
+    eq(ordinary, null, '1.39 is inside this band, so say nothing');
+
+    // Past the band's top decile it is worth naming — but as a warning.
+    const scarce = tagOf(1.90);
+    eq(scarce.code, 'WATCH');
+    eq(scarce.label, 'NO CHEAP COPY');
+    ok(/not a bargain/i.test(scarce.why), 'must not be mistakable for a buy');
+  });
+
+  it('the ordinary middle of a band says nothing at all', () => {
+    eq(tagOf(0.97), null, 'a median card must not generate a row-filling verdict');
+  });
+
+  it('thresholds are per band, not absolute', () => {
+    const cheapBand = { min: 5, max: 20, n: 806, p10: 0.65, p90: 1.22 };
+    // 0.70 is a bargain among $100-500 cards but ordinary among $5-20 cards.
+    eq(E.actionTag({ sig: sig(0.70), age: null, hist: null, band }).code, 'BUY');
+    eq(E.actionTag({ sig: sig(0.70), age: null, hist: null, band: cheapBand }), null);
+  });
+
+  it('says nothing when a band has too little data to have a threshold', () => {
+    eq(E.actionTag({ sig: sig(0.10), age: null, hist: null,
+                     band: { min: 0, max: 5, n: 3, p10: null, p90: null } }), null);
+    eq(E.actionTag({ sig: sig(0.10), age: null, hist: null, band: null }), null);
+  });
+
+  it('owning it changes what the same number means', () => {
+    eq(tagOf(1.90, { owned: true }).code, 'HOLD');
+    eq(tagOf(0.42, { owned: true, ownedTrade: true }).code, 'TRIM');
+  });
+
+  it('one stray cheap listing does not trigger a trim', () => {
+    const outlier = sig(0.42, 0.80);           // low far under mid
+    ok(outlier.thinLow);
+    const t = E.actionTag({ sig: outlier, age: null, hist: null, band,
+                            owned: true, ownedTrade: true });
+    ok(!t || t.code !== 'TRIM', 'a single outlier is not broad undercutting');
+  });
+
+  it('a bargain built on one listing warns about condition', () => {
+    const t = E.actionTag({ sig: sig(0.42, 0.80), age: null, hist: null, band, owned: false });
+    eq(t.code, 'BUY');
+    ok(/condition/i.test(t.why), 'must warn that a lone cheap copy may be damaged');
+  });
+
+  describe('spreadBands — thresholds measured, not guessed');
+
+  it('produces a threshold per band from real ratios', () => {
+    const cards = [];
+    for (let i = 0; i < 40; i++) cards.push({ market_price: 200, inventory_price: 200 * (0.5 + i * 0.02) });
+    const bands = E.spreadBands(cards);
+    const b = E.bandFor(bands, 200);
+    ok(b.p10 != null && b.p90 != null, 'a well-populated band gets thresholds');
+    ok(b.p10 < b.p90);
+    eq(b.n, 40);
+  });
+
+  it('refuses to invent a threshold from too few cards', () => {
+    const bands = E.spreadBands([{ market_price: 200, inventory_price: 100 }]);
+    eq(E.bandFor(bands, 200).p10, null, 'one sample is not a decile');
+  });
+
+  it('bands cards by market price, not by listing price', () => {
+    const bands = E.spreadBands([{ market_price: 600, inventory_price: 10 }]);
+    eq(E.bandFor(bands, 600).n, 1);
+    eq(E.bandFor(bands, 200).n, 0);
+  });
+
+  it('ignores cards with no usable price', () => {
+    const bands = E.spreadBands([
+      { market_price: 0, inventory_price: 5 },
+      { market_price: 200, inventory_price: null },
+      { market_price: 200, inventory_price: 100 }
+    ]);
+    eq(E.bandFor(bands, 200).n, 1);
+  });
+
+  describe('junk listings — a floor several times market is not a price');
+
+  it('an absurd floor is marked, not ranked', () => {
+    // Riku Doldo III: a $4.76 common whose only listing is $2,608.
+    const sig = E.spreadSignal({ market_price: 4.76, inventory_price: 2608.38, mid_price: 2608.38 });
+    eq(sig.absurd, true);
+    eq(sig.state, 'NOFLOOR');
+    eq(sig.score, 0, 'must not out-rank real cards in a sort');
+  });
+
+  it('a genuinely dry card is NOT treated as junk', () => {
+    // Sakazuki (Manga): $1,224 market, $1,696 floor. Real, just expensive.
+    const sig = E.spreadSignal({ market_price: 1224, inventory_price: 1696 });
+    eq(sig.absurd, false);
+    eq(sig.state, 'DRY');
+  });
+
+  it('no usable floor means no verdict at all', () => {
+    const sig = E.spreadSignal({ market_price: 4.76, inventory_price: 2608.38 });
+    eq(E.actionTag({ sig, age: null, hist: null,
+                     band: { min: 0, max: 5, n: 900, p10: 0.5, p90: 1.2 } }), null,
+       'silence beats a confident wrong answer');
+  });
+
+  it('the cut sits above real market behaviour, not inside it', () => {
+    // p90 among $500+ cards measured 2.68, so the guard must not clip it.
+    ok(E.ABSURD_RATIO > 2.68, 'must not discard legitimate high-end spreads');
+  });
+
+  describe('spreadSignal — the 4th price point');
+
+  it('a low far under the mid is flagged as thin', () => {
+    eq(E.spreadSignal({ market_price: 128, inventory_price: 106, mid_price: 154 }).thinLow, true);
+    eq(E.spreadSignal({ market_price: 128, inventory_price: 120, mid_price: 130 }).thinLow, false);
+  });
+
+  it('a missing mid does not invent a thin low', () => {
+    eq(E.spreadSignal({ market_price: 100, inventory_price: 50 }).thinLow, false);
+  });
+
+  /* ============================ duplicate permanent binders =============== */
+  describe('permanent binders survive being used on two devices');
+
+  // The real bug: phone and PC each ran ensureCollections() before their first
+  // sync, each minted "Keeping" + "Trade / Sell" with a random uid(), then
+  // pulled each other. Merge kept all four, correctly — they were four rows.
+  const twoDevices = () => ([
+    { id: 'phone-k', name: 'Keeping',      kind: 'keep',  locked: 1, createdAt: 100, updatedAt: 100, deleted: 0 },
+    { id: 'phone-t', name: 'Trade / Sell', kind: 'trade', locked: 1, createdAt: 100, updatedAt: 100, deleted: 0 },
+    { id: 'pc-k',    name: 'Keeping',      kind: 'keep',  locked: 1, createdAt: 200, updatedAt: 200, deleted: 0 },
+    { id: 'pc-t',    name: 'Trade / Sell', kind: 'trade', locked: 1, createdAt: 200, updatedAt: 200, deleted: 0 }
+  ]);
+
+  it('collapses four binders back to two', () => {
+    const r = C.dedupePermanent(twoDevices(), []);
+    eq(r.mergedBinders, 2);
+    eq(C.live(r.cols).length, 2, 'exactly one Keeping and one Trade / Sell');
+    eq(C.live(r.cols).filter(c => c.kind === 'keep').length, 1);
+    eq(C.live(r.cols).filter(c => c.kind === 'trade').length, 1);
+  });
+
+  it('keeps the OLDEST binder, which holds the real history', () => {
+    const r = C.dedupePermanent(twoDevices(), []);
+    eq(C.live(r.cols).find(c => c.kind === 'keep').id, 'phone-k');
+  });
+
+  it('NOTHING is orphaned — items follow their binder', () => {
+    const items = [
+      { id: 'i1', colId: 'phone-k', key: '1', qty: 1, updatedAt: 1, deleted: 0 },
+      { id: 'i2', colId: 'pc-k',    key: '2', qty: 3, updatedAt: 1, deleted: 0 },
+      { id: 'i3', colId: 'pc-t',    key: '3', qty: 1, updatedAt: 1, deleted: 0 }
+    ];
+    const r = C.dedupePermanent(twoDevices(), items);
+    eq(r.movedItems, 2);
+    eq(r.items.length, 3, 'no item may be dropped');
+    const live = C.live(r.cols).map(c => c.id);
+    ok(r.items.every(i => live.indexOf(i.colId) > -1),
+       'every item must point at a surviving binder');
+    eq(r.items.find(i => i.id === 'i2').qty, 3, 'quantities survive the move');
+  });
+
+  it('a moved item is stamped so the fix reaches other devices', () => {
+    const items = [{ id: 'i2', colId: 'pc-k', key: '2', qty: 1, updatedAt: 1, deleted: 0 }];
+    const r = C.dedupePermanent(twoDevices(), items);
+    ok(r.items[0].updatedAt > 1, 'must look dirty to the sync');
+  });
+
+  it('the canonical fixed id wins over an older random one', () => {
+    const cols = twoDevices().concat([
+      Object.assign(C.newPermanent('keep'), { createdAt: 999, updatedAt: 999 })
+    ]);
+    const r = C.dedupePermanent(cols, []);
+    eq(C.live(r.cols).find(c => c.kind === 'keep').id, C.PERMANENT_ID.keep);
+  });
+
+  it('leaves a healthy single pair completely alone', () => {
+    const cols = [C.newPermanent('keep'), C.newPermanent('trade')];
+    const r = C.dedupePermanent(cols, []);
+    eq(r.mergedBinders, 0);
+    eq(r.cols, cols, 'must not churn rows that are already correct');
+  });
+
+  it('does not touch binders you made yourself', () => {
+    const cols = twoDevices().concat([
+      { id: 'mine', name: 'Slabs', kind: 'keep', createdAt: 300, updatedAt: 300, deleted: 0 }
+    ]);
+    const r = C.dedupePermanent(cols, []);
+    ok(C.live(r.cols).some(c => c.id === 'mine'), 'an unlocked binder is not a duplicate');
+    eq(C.live(r.cols).length, 3);
+  });
+
+  it('still merges when the sheet stripped the locked flag', () => {
+    // An older deployed Apps Script has no `locked` column, so the flag is
+    // lost on the round-trip. Relying on it alone would silently skip the
+    // merge and leave the duplicates the user already reported.
+    const unlocked = twoDevices().map(c => { const x = Object.assign({}, c); delete x.locked; return x; });
+    const r = C.dedupePermanent(unlocked, []);
+    eq(r.mergedBinders, 2, 'name + kind must be enough on their own');
+    eq(C.live(r.cols).length, 2);
+  });
+
+  it('re-asserts locked on the survivor so it is not a rescue every time', () => {
+    const unlocked = twoDevices().map(c => { const x = Object.assign({}, c); delete x.locked; return x; });
+    const r = C.dedupePermanent(unlocked, []);
+    ok(C.live(r.cols).every(c => c.locked === 1));
+  });
+
+  it('a binder you named something else is never treated as permanent', () => {
+    ok(!C.isPermanent({ name: 'Slabs', kind: 'keep' }, 'keep'));
+    ok(C.isPermanent({ name: 'Keeping', kind: 'keep' }, 'keep'));
+    ok(C.isPermanent({ name: 'keeping  ', kind: 'keep' }, 'keep'), 'case and spacing tolerant');
+    ok(!C.isPermanent({ name: 'Keeping', kind: 'keep' }, 'trade'), 'wrong kind does not match');
+  });
+
+  it('two devices creating binders fresh now agree on the id', () => {
+    eq(C.newPermanent('keep').id, C.newPermanent('keep').id,
+       'ids must be deterministic, not random');
+    ok(C.newPermanent('keep').id !== C.newPermanent('trade').id);
+    eq(C.newPermanent('trade').tradePct, 80, 'trade binders keep their 80% default');
+    eq(C.newPermanent('keep').locked, 1);
+  });
+
+  /* ================================ hostile and degenerate input ========== */
+  describe('sync payloads and hostile rows — found by fuzzing the model');
+
+  it('a partial sync payload does not abandon the whole merge', () => {
+    // Real crash path: pullNow does mergeRows(S.cols, remote.collections).
+    // A response missing that key threw "remote is not iterable" and lost the
+    // arrays that DID arrive.
+    eq(C.mergeRows([{ id: 'a', updatedAt: 1 }], undefined).length, 1);
+    eq(C.mergeRows([{ id: 'a', updatedAt: 1 }], null).length, 1);
+    eq(C.mergeRows(null, [{ id: 'b', updatedAt: 1 }]).length, 1);
+    eq(C.mergeRows(null, null).length, 0);
+  });
+
+  it('rows with no id cannot poison the merge', () => {
+    const out = C.mergeRows([{ id: 'a', updatedAt: 1 }], [null, {}, { id: null }, { id: 'b', updatedAt: 1 }]);
+    eq(out.length, 2, 'only the two real rows survive');
+  });
+
+  it('a negative quantity cannot subtract from your collection', () => {
+    eq(C.qtyOf({ qty: -5 }), 0);
+    eq(C.qtyOf({ qty: 'abc' }), 0);
+    eq(C.qtyOf({ qty: NaN }), 0);
+    eq(C.qtyOf({ qty: null }), 0);
+    eq(C.qtyOf({}), 0);
+    eq(C.qtyOf({ qty: 2.7 }), 2, 'fractional cards do not exist');
+    eq(C.qtyOf({ qty: 1e9 }), 9999, 'clamped, not trusted');
+    eq(C.qtyOf({ qty: '3' }), 3, 'a numeric string is still a number');
+  });
+
+  it('a hostile qty cannot invent portfolio value', () => {
+    const v = C.valueOf([{ id:'a', colId:'c', key:'1', qty:-5, updatedAt:1, deleted:0 }], () => 100);
+    eq(v.total, 0);
+    eq(v.cards, 0);
+  });
+
+  describe('cards stranded on a deleted binder');
+
+  // A sync race makes these: device A deletes a binder, device B adds a card
+  // to it. Merge keeps both. The card is invisible but was counted in totals.
+  const cols = [{ id:'live', kind:'keep', updatedAt:1, deleted:0 },
+                { id:'gone', kind:'keep', updatedAt:2, deleted:1 }];
+  const rows = [{ id:'i1', colId:'live', key:'1', qty:1, updatedAt:1, deleted:0 },
+                { id:'i2', colId:'gone', key:'2', qty:1, updatedAt:1, deleted:0 }];
+
+  it('separates placed cards from stranded ones', () => {
+    eq(C.livePlaced(rows, cols).map(i => i.id), ['i1']);
+    eq(C.orphans(rows, cols).map(i => i.id), ['i2']);
+  });
+
+  it('the total counts only what you can actually see', () => {
+    eq(C.valueOf(C.livePlaced(rows, cols), () => 100).total, 100,
+       'not 200 — the stranded card is not in any binder');
+  });
+
+  it('stranded cards are excluded, never deleted', () => {
+    eq(C.orphans(rows, cols).length + C.livePlaced(rows, cols).length,
+       C.live(rows).length, 'every live row is in exactly one of the two sets');
+  });
+
+  it('an item pointing at a binder that never existed is stranded, not lost', () => {
+    const ghost = [{ id:'g', colId:'never-existed', key:'1', qty:1, updatedAt:1, deleted:0 }];
+    eq(C.orphans(ghost, cols).length, 1);
+    eq(C.livePlaced(ghost, cols).length, 0);
+  });
+
+  /* ===================================================== cardKey ========= */
+  describe('cardKey — three separate id collisions, all real');
+
+  it('separates a card from its parallel (card_set_id is shared)', () => {
+    const base = card({ card_image_id: 'OP01-001', card_name: 'Roronoa Zoro (001)' });
+    const par  = card({ card_image_id: 'OP01-001_p1', card_name: 'Roronoa Zoro (001) (Parallel)' });
+    ok(E.cardKey(base) !== E.cardKey(par), 'base and parallel must not share a key');
+  });
+
+  it('separates cards sharing a card_image_id across sets (OP07-076 was three cards)', () => {
+    const a = card({ set_id: 'OP-07', card_image_id: 'OP07-076', card_name: 'Slow-Slow Beam Sword' });
+    const b = card({ set_id: 'PRB-02', card_image_id: 'OP07-076', card_name: 'Slow-Slow Beam Sword (Pirate Foil)' });
+    ok(E.cardKey(a) !== E.cardKey(b), 'same image id in different sets must differ');
+  });
+
+  it('separates two cards sharing set AND image id (Jolly Roger vs Alt Art)', () => {
+    const a = card({ set_id: 'PRB-02', card_image_id: 'OP07-076', card_name: 'X (Reprint)' });
+    const b = card({ set_id: 'PRB-02', card_image_id: 'OP07-076', card_name: 'X (Pirate Foil)' });
+    ok(E.cardKey(a) !== E.cardKey(b), 'name must be part of the key');
+  });
+
+  /* ==================================================== classify ========= */
+  describe('classify — the rarity field lies about chase tier');
+
+  it('Manga Rare is not its printed rarity (Kuzan is stamped R, sells $1060)', () => {
+    eq(E.classify(card({ rarity: 'R', card_name: 'Kuzan (Manga)' })).slot, 'MANGA');
+  });
+
+  it('Super Alternate Art is ULTRA, not the base rarity it prints', () => {
+    // This one put an $8,490 card in the Secret Rare slot and made OP-13
+    // report $2,300 of box EV.
+    eq(E.classify(card({ rarity: 'SEC', card_name: 'Luffy (Super Alternate Art)' })).slot, 'ULTRA');
+    eq(E.classify(card({ rarity: 'SEC', card_name: 'Luffy (Red Super Alternate Art)' })).slot, 'ULTRA');
+  });
+
+  it('Gold and Silver are ULTRA', () => {
+    eq(E.classify(card({ rarity: 'SR', card_name: 'Teach (SP) (Gold)' })).slot, 'ULTRA');
+    eq(E.classify(card({ rarity: 'SR', card_name: 'Teach (SP) (Silver)' })).slot, 'ULTRA');
+  });
+
+  it('highest-ranked tag wins when a card carries several', () => {
+    eq(E.classify(card({ rarity: 'SEC',
+      card_name: 'Shanks (Parallel) (Manga) (Alternate Art)' })).slot, 'MANGA');
+  });
+
+  it('character names in brackets are not variant tags', () => {
+    // "(Galdino)" and "(056)" must not be mistaken for treatments.
+    eq(E.classify(card({ rarity: 'R', card_name: 'Mr.3(Galdino) (056)' })).slot, 'R');
+  });
+
+  it('excludes what cannot come out of a pack', () => {
+    eq(E.classify(card({ rarity: 'SR', card_name: 'X (Box Topper)' })).slot, null);
+    eq(E.classify(card({ rarity: 'SR', card_name: 'X (Wanted Poster)' })).slot, null);
+    eq(E.classify(card({ rarity: 'PR', card_name: 'X' })).slot, null);
+  });
+
+  it('DON!! splits booster from non-booster, and Gold from plain', () => {
+    eq(E.classify(card({ rarity: 'DON', donBooster: true,
+      card_name: 'DON!! Card (Egghead)' })).slot, 'DON');
+    eq(E.classify(card({ rarity: 'DON', donBooster: true,
+      card_name: 'DON!! Card (Zoro) (Gold)' })).slot, 'DONGOLD');
+    eq(E.classify(card({ rarity: 'DON', donBooster: false, donProduct: 'Double Pack Set',
+      card_name: 'DON!! Card (Crocodile)' })).slot, null);
+  });
+
+  /* ================================================= rarityBadge ========= */
+  describe('rarityBadge — printed rarity vs treatment');
+
+  it('Manga shows its printed rarity WITH a star (Sakazuki = SR)', () => {
+    const b = E.rarityBadge(card({ rarity: 'SR', card_name: 'Sakazuki (Manga)' }));
+    eq(b.text, 'SR'); eq(b.star, true); eq(b.tone, 'MANGA');
+  });
+
+  it('SP shows SP, not the base rarity underneath (Ms. All Sunday is stamped SR)', () => {
+    const b = E.rarityBadge(card({ rarity: 'SR', card_name: 'Ms. All Sunday (SP)' }));
+    eq(b.text, 'SP'); eq(b.star, false);
+  });
+
+  it('Gold DON!! reads DON with a gold tone', () => {
+    const b = E.rarityBadge(card({ rarity: 'DON', donBooster: true,
+      card_name: 'DON!! Card (Zoro) (Gold)' }));
+    eq(b.text, 'DON'); eq(b.tone, 'GOLD');
+  });
+
+  /* =============================================== buildSetIndex ========= */
+  describe('buildSetIndex');
+
+  const sample = [
+    card({ card_image_id: 'a', card_name: 'Cheap', rarity: 'C', market_price: 1 }),
+    card({ card_image_id: 'b', card_name: 'Mid', rarity: 'R', market_price: 50 }),
+    card({ card_image_id: 'c', card_name: 'Chase (Manga)', rarity: 'R', market_price: 5000 }),
+    card({ card_image_id: 'd', card_name: 'Topper (Box Topper)', rarity: 'SR', market_price: 900 })
+  ];
+  const idx = E.buildSetIndex('OP-01', sample, priceOf);
+
+  it('`all` is sorted price-descending — signalRows breaks early on this', () => {
+    const prices = idx.all.map(e => e.price);
+    eq(prices, prices.slice().sort((x, y) => y - x), 'all must be descending');
+  });
+
+  it('excluded cards stay out of the pullable pool', () => {
+    ok(!idx.all.some(e => /Box Topper/.test(e.card.card_name)), 'box topper must be excluded');
+    eq(idx.all.length, 3);
+  });
+
+  it('slot averages only count that slot', () => {
+    eq(idx.slots.MANGA.count, 1);
+    eq(idx.slots.MANGA.avgPrice, 5000);
+  });
+
+  /* ==================================================== configFit ======== */
+  describe('configFit — the check that only worked one way');
+
+  it('flags a material rate against an empty pool (the Extra Booster bug)', () => {
+    const fit = E.configFit(idx, { perBox: { UC: 72 }, packsPerBox: 24, cardsPerPack: 12 });
+    ok(fit.issues.some(i => i.severity === 'error' && i.slot === 'UC'),
+       '72 uncommons a box with none in the set must error');
+  });
+
+  it('flags a populated pool with a ZERO rate (Treasure Rares were unpullable)', () => {
+    // configFit only checked the other direction, so TR sat at 0 per box and
+    // "Vista (TR)" reported as impossible to pull.
+    const fit = E.configFit(idx, { perBox: { MANGA: 0 }, packsPerBox: 24, cardsPerPack: 12 });
+    ok(fit.issues.some(i => i.severity === 'error' && i.slot === 'MANGA'),
+       'cards present with a 0 rate must error');
+  });
+
+  it('stays quiet about a small rate against an empty pool (DON!! noise)', () => {
+    const fit = E.configFit(idx, { perBox: { DON: 1 }, packsPerBox: 24, cardsPerPack: 12 });
+    ok(!fit.issues.some(i => i.slot === 'DON' && i.severity === 'error'),
+       'one absent DON!! is a data gap, not a broken structure');
+  });
+
+  /* ================================================ probability ========== */
+  describe('odds');
+
+  it('per-pack probability is rate / poolSize / packsPerBox', () => {
+    const cfg = { perBox: { MANGA: 0.033 }, packsPerBox: 24, cardsPerPack: 12 };
+    const p = E.perPackProbability(idx, cfg, E.cardKey(sample[2]));
+    near(p.p, 0.033 / 1 / 24, 1e-9, 'p');
+    eq(p.slot, 'MANGA');
+  });
+
+  it('a zero rate marks the card impossible rather than infinitely rare', () => {
+    const cfg = { perBox: { MANGA: 0 }, packsPerBox: 24, cardsPerPack: 12 };
+    eq(E.perPackProbability(idx, cfg, E.cardKey(sample[2])).impossible, true);
+  });
+
+  it('ripVsBuy: chasing one specific card usually loses on gross cost', () => {
+    const r = E.ripVsBuy({ p: 0.01, packPrice: 5, evPack: 2, singlePrice: 100,
+                           sellFriction: 1, packsPerBox: 24 });
+    near(r.expectedPacks, 100, 1e-9, 'expected packs');
+    near(r.grossCost, 500, 1e-9, 'gross cost');
+    eq(r.simpleVerdict, 'BUY');
+  });
+
+  it('a card cheaper than two packs is not a chase at all', () => {
+    const r = E.ripVsBuy({ p: 0.5, packPrice: 5, evPack: 2, singlePrice: 3,
+                           sellFriction: 0.15, packsPerBox: 24 });
+    eq(r.simpleVerdict, 'TRIVIAL');
+  });
+
+  /* =================================================== history ========== */
+  describe('parseHistory — flat is not the same as stable');
+
+  function histRow(values, now) {
+    const row = { market_price: now };
+    // parseHistory reads Day13 down to Day1, then appends market_price.
+    values.forEach((v, i) => { row['Day' + (13 - i) + '_Market_Price'] = v; });
+    return row;
+  }
+
+  it('detects a frozen series (a 392-day-old card repeats one number 13x)', () => {
+    const h = E.parseHistory(histRow(new Array(13).fill(249.21), 249.21));
+    eq(h.frozen, true);
+    near(h.changePct, 0, 1e-9, 'no change');
+  });
+
+  it('a genuinely moving price is not frozen', () => {
+    const h = E.parseHistory(histRow([100,101,102,103,104,105,106,107,108,109,110,111,112], 113));
+    eq(h.frozen, false);
+    ok(h.changePct > 0, 'should be rising');
+  });
+
+  /* ==================================================== signals ========== */
+  describe('spreadSignal + actionTag');
+
+  it('floor near market reads as tightening', () => {
+    eq(E.spreadSignal({ inventory_price: 96, market_price: 100 }).state, 'TIGHT');
+    eq(E.spreadSignal({ inventory_price: 40, market_price: 100 }).state, 'LOOSE');
+  });
+
+  it('stale data is refused outright, however good the spread looks', () => {
+    const tag = E.actionTag({ sig: E.spreadSignal({ inventory_price: 150, market_price: 100 }),
+                              age: 167, hist: null, owned: false });
+    eq(tag.code, 'STALE');
+  });
+
+  it('a frozen series cannot produce momentum', () => {
+    const hist = E.parseHistory(histRow(new Array(13).fill(50), 50));
+    const tag = E.actionTag({ sig: E.spreadSignal({ inventory_price: 49, market_price: 50 }),
+                              age: 2, hist, owned: false });
+    eq(tag.code, 'STALE');
+  });
+
+  it('needs BOTH supply and momentum before it says buy', () => {
+    const sig = E.spreadSignal({ inventory_price: 96, market_price: 100 });
+    const flat = E.parseHistory(histRow([100,100,100,100,100,100,100,100,100,100,100,100,101], 100));
+    eq(E.actionTag({ sig, age: 2, hist: flat, owned: false }).code, 'WATCH');
+
+    const rising = E.parseHistory(histRow([90,91,92,93,94,95,96,97,98,99,100,101,102], 110));
+    eq(E.actionTag({ sig, age: 2, hist: rising, owned: false }).code, 'BUY');
+  });
+
+  it('ownership changes the call from BUY to HOLD', () => {
+    const sig = E.spreadSignal({ inventory_price: 96, market_price: 100 });
+    const rising = E.parseHistory(histRow([90,91,92,93,94,95,96,97,98,99,100,101,102], 110));
+    eq(E.actionTag({ sig, age: 2, hist: rising, owned: true }).code, 'HOLD');
+  });
+
+  it('TRIM only fires on trade stock that is falling into soft supply', () => {
+    const sig = E.spreadSignal({ inventory_price: 40, market_price: 100 });
+    const falling = E.parseHistory(histRow([110,109,108,107,106,105,104,103,102,101,100,99,98], 90));
+    eq(E.actionTag({ sig, age: 2, hist: falling, owned: true, ownedTrade: true }).code, 'TRIM');
+  });
+
+  /* ============================================ chaseConcentration ====== */
+  describe('chaseConcentration — sorted by EV contribution, NOT price');
+
+  it('documents the ordering that broke the Biggest hit column', () => {
+    // conc.all[0] is the biggest EV CONTRIBUTOR. Set Explorer read it as the
+    // most expensive card, so OP-09 showed $120 instead of its $5,500 Manga.
+    // idx.all[0] is the price-sorted answer.
+    const cfg = { perBox: { C: 168, R: 26, MANGA: 0.033 }, packsPerBox: 24, cardsPerPack: 12 };
+    const conc = E.chaseConcentration(idx, cfg, 5);
+    eq(idx.all[0].price, 5000, 'idx.all is price-sorted');
+    ok(conc.all[0].entry.price !== 5000,
+       'a common pulled 168x a box out-contributes a 1-in-2000 chase');
+  });
+
+  /* ================================================== collection ======== */
+  describe('collection — value, merge, scoreboard');
+
+  const priceFor = key => (key === 'k1' ? 100 : key === 'k2' ? 10 : null);
+
+  it('graded cards use your entered value, never the market feed', () => {
+    const items = [C.newItem('c1', 'k1', { grader: 'PSA', grade: 10, value: 3500, qty: 1 })];
+    const v = C.valueOf(items, priceFor);
+    eq(v.graded, 3500);
+    eq(v.raw, 0, 'a graded card must not also count at market');
+  });
+
+  it('a graded card with no value entered is unpriced, not free', () => {
+    const items = [C.newItem('c1', 'k1', { grader: 'PSA', grade: 10, qty: 1 })];
+    eq(C.valueOf(items, priceFor).unpriced, 1);
+  });
+
+  it('gain is measured only over cards that HAVE a cost basis', () => {
+    // Comparing a whole portfolio to a partial cost basis invented profit and
+    // reported "up 418%".
+    const items = [
+      C.newItem('c1', 'k1', { qty: 1, paid: 60 }),   // 100 market, 60 paid
+      C.newItem('c1', 'k2', { qty: 1 })              // 10 market, no cost
+    ];
+    const v = C.valueOf(items, priceFor);
+    eq(v.total, 110, 'total is everything');
+    eq(v.cost, 60);
+    eq(v.gain, 40, 'gain is 100-60, not 110-60');
+    eq(v.costComplete, false);
+  });
+
+  it('trade rate defaults per binder kind', () => {
+    eq(C.rateOf({ kind: 'trade' }), 80);
+    eq(C.rateOf({ kind: 'keep' }), 100);
+    eq(C.rateOf({ kind: 'trade', tradePct: 60 }), 60);
+  });
+
+  it('mergeRows is last-write-wins per row', () => {
+    const local  = [{ id: 'a', qty: 1, updatedAt: 100 }, { id: 'b', qty: 9, updatedAt: 500 }];
+    const remote = [{ id: 'a', qty: 7, updatedAt: 300 }, { id: 'b', qty: 2, updatedAt: 200 }];
+    const merged = C.mergeRows(local, remote).sort((x, y) => x.id < y.id ? -1 : 1);
+    eq(merged[0].qty, 7, 'newer remote wins');
+    eq(merged[1].qty, 9, 'newer local survives');
+  });
+
+  it('tombstones survive a merge so deletes do not resurrect', () => {
+    const merged = C.mergeRows([], [{ id: 'x', deleted: 1, updatedAt: 10 }]);
+    eq(merged.length, 1);
+    eq(C.live(merged).length, 0, 'live() hides them but merge keeps them');
+  });
+
+  /* v2: scoreboard takes a setIdFor lookup because productId keys carry no set.
+     These fixtures use v1-shaped keys, so the stub reproduces what the real
+     lookup does in app.js — resolve the row to a card and read its set_id. */
+  const setIdOf = key => String(key).split('|')[0];
+
+  it('scoreboard counts pulls only — a shopping spree is not luck', () => {
+    const opens = [C.newOpen('OP-16', 2, 300)];
+    const items = [
+      C.newItem('c1', 'OP-16|a|A', { qty: 1, src: 'pull', value: 500 }),
+      C.newItem('c1', 'OP-16|b|B', { qty: 1, src: 'buy',  value: 900 })
+    ];
+    const sb = C.scoreboard(opens, items, priceFor, s => s, null, setIdOf);
+    eq(sb.total.spent, 300);
+    eq(sb.total.pulledValue, 500, 'the bought card must not count as winnings');
+    eq(sb.total.net, 200);
+  });
+
+  it('boxes logged with nothing pulled reads as incomplete, not a total loss', () => {
+    const sb = C.scoreboard([C.newOpen('OP-16', 2, 300)], [], priceFor, s => s, null, setIdOf);
+    eq(sb.rows[0].incomplete, true);
+  });
+
+  it('a promo marked "pulled" cannot invent ripping profit', () => {
+    // Adding promos and starter decks reintroduced the bought-as-pulled bug in
+    // a new shape: newItem defaults to src 'pull', so a $3,499 Regionals card
+    // showed up as a phantom PROMO row with winnings and no spend.
+    const isBooster = id => id === 'OP-16';
+    const promo = C.newItem('c1', 'PROMO|OP14-112|Boa Hancock (Regionals)',
+                            { qty: 1, value: 3499, src: 'pull' });
+    const sb = C.scoreboard([C.newOpen('OP-16', 1, 150)], [promo], () => null, s => s, isBooster, setIdOf);
+    eq(sb.total.pulledValue, 0, 'a promo can never be pack winnings');
+    ok(!sb.rows.some(r => r.setId === 'PROMO'), 'no phantom promo row');
+  });
+
+  it('starter-deck cards are excluded from the scoreboard too', () => {
+    const isBooster = id => id === 'OP-16';
+    const deck = C.newItem('c1', 'ST-01|ST01-001|Luffy', { qty: 1, value: 5, src: 'pull' });
+    const sb = C.scoreboard([], [deck], () => null, s => s, isBooster, setIdOf);
+    eq(sb.rows.length, 0);
+  });
+
+  /* ----------------------------------------------------------- render --- */
+  const passed = results.filter(r => r.pass).length;
+  const failed = results.length - passed;
+
+  document.getElementById('summary').className = 'summary ' + (failed ? 'bad' : 'ok');
+  document.getElementById('summary').innerHTML =
+    (failed ? `${failed} failing, ${passed} passing` : `All ${passed} tests passing`) +
+    `<span>${new Set(results.map(r => r.suite)).size} suites · engine.js + collection.js · no DOM, no network</span>`;
+
+  const groups = {};
+  results.forEach(r => { (groups[r.suite] = groups[r.suite] || []).push(r); });
+
+  document.getElementById('out').innerHTML = Object.keys(groups).map(s => `
+    <div class="suite">
+      <h2>${s}</h2>
+      ${groups[s].map(r => `
+        <div class="t ${r.pass ? 'pass' : 'fail'}">
+          <span class="mark">${r.pass ? '✓' : '✕'}</span>
+          <span>${r.name}${r.why ? `<span class="why">${r.why}</span>` : ''}</span>
+        </div>`).join('')}
+    </div>`).join('');
+
+  // Machine-readable for automated checks.
+  window.__TEST_RESULTS__ = { passed, failed, results };
+})(OQ_DATA, OQ_ENGINE, OQ_COLLECTION);
+</script>
+</body>
+</html>
