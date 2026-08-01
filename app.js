@@ -1134,10 +1134,10 @@
       <tr class="clickable" data-set="${esc(r.id)}">
         <td><b>${esc(r.short)}</b> <span class="muted small">${esc(r.name)}</span>
           ${r.unverified ? ' <span class="tag est" title="Pack structure is not officially documented — expected value here is a rough read">?</span>' : ''}</td>
-        <td class="num">${E.money(r.box)}${r.est ? ' <span class="tag est">EST</span>' : ''}</td>
-        <td class="num">${r.case_ == null ? '<span class="muted">—</span>' : E.money(r.case_)}</td>
-        <td class="num">${E.money(r.evBox)}</td>
-        <td class="num">${E.money(r.evPack)}</td>
+        <td class="num" data-l="Box price">${E.money(r.box)}${r.est ? ' <span class="tag est">EST</span>' : ''}</td>
+        <td class="num" data-l="Case">${r.case_ == null ? '<span class="muted">—</span>' : E.money(r.case_)}</td>
+        <td class="num" data-l="EV / box">${E.money(r.evBox)}</td>
+        <td class="num" data-l="EV / pack">${E.money(r.evPack)}</td>
         <td class="num ${r.roi == null ? '' : r.roi >= 0 ? 'up' : 'down'}">
           <b>${r.roi == null ? '—' : (r.roi >= 0 ? '+' : '') + E.pct(r.roi, 0)}</b></td>
         <td class="num">
@@ -1291,14 +1291,14 @@
           <img src="${esc(c.card_image)}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">
           <div class="nm"><b>${esc(c.card_name)}</b><span>${esc(c.card_set_id)}</span></div>
         </div></td>
-        <td><span class="tag">${esc(setShort(r.setId))}</span></td>
-        <td class="num">${E.money(r.market)}</td>
-        <td class="num muted">${E.money(r.inv)}</td>
-        <td class="num muted">${r.mid ? E.money(r.mid) : '—'}</td>
-        <td class="num">${E.pct(r.ratio, 0)}</td>
-        <td class="num">${isStale ? '<span class="badge-state st-NORMAL">—</span>'
+        <td data-l="Set"><span class="tag">${esc(setShort(r.setId))}</span></td>
+        <td class="num" data-l="Market">${E.money(r.market)}</td>
+        <td class="num muted" data-l="Floor">${E.money(r.inv)}</td>
+        <td class="num muted" data-l="Mid">${r.mid ? E.money(r.mid) : '—'}</td>
+        <td class="num" data-l="Floor / market">${E.pct(r.ratio, 0)}</td>
+        <td class="num" data-l="Supply">${isStale ? '<span class="badge-state st-NORMAL">—</span>'
                                   : `<span class="badge-state st-${r.sig.state}">${r.sig.state}</span>`}</td>
-        <td class="num">${r.tag ? `<span class="call call-${r.tag.code}" title="${esc(r.tag.why)}">${r.tag.label}</span>`
+        <td class="num" data-l="Call">${r.tag ? `<span class="call call-${r.tag.code}" title="${esc(r.tag.why)}">${r.tag.label}</span>`
                                 : '<span class="muted">—</span>'}</td>
       </tr>`;
     }).join('') || `<tr><td colspan="8" class="muted">Nothing matches those filters.</td></tr>`;
@@ -1984,8 +1984,8 @@
           <div class="nm"><b>${esc(card ? card.card_name : it.key)}</b>
             <span>${esc(card ? card.card_set_id : '')}</span></div>
         </div></td>
-        <td><span class="tag">${esc(card ? setShort(card.set_id) : '—')}</span></td>
-        <td>
+        <td data-l="Set"><span class="tag">${esc(card ? setShort(card.set_id) : '—')}</span></td>
+        <td data-l="State">
           <select class="it-grader" data-id="${esc(it.id)}" style="width:auto;display:inline-block;padding:4px 6px;font-size:12px">
             <option value="">Raw</option>
             ${D.GRADERS.map(g => `<option value="${g}"${it.grader === g ? ' selected' : ''}>${g}</option>`).join('')}
@@ -1999,20 +1999,20 @@
                  ${D.CONDITIONS.map(c => `<option value="${c.code}"${it.cond === c.code ? ' selected' : ''}>${c.code}</option>`).join('')}
                </select>`}
         </td>
-        <td class="num"><input type="number" class="it-qty" data-id="${esc(it.id)}" min="0" step="1"
+        <td class="num" data-l="Qty"><input type="number" class="it-qty" data-id="${esc(it.id)}" min="0" step="1"
              value="${qty}" style="width:62px;text-align:right;padding:4px 6px;font-size:12px"></td>
-        <td class="num">${graded || manual
+        <td class="num" data-l="Each">${graded || manual
             ? `<input type="number" class="it-value" data-id="${esc(it.id)}" min="0" step="0.01"
                  placeholder="${graded ? 'graded $' : 'market'}" value="${manual ? it.value : ''}"
                  style="width:88px;text-align:right;padding:4px 6px;font-size:12px"
                  title="${graded ? 'No free feed for graded prices — enter what it is worth' : 'Overrides the live market price'}">`
             : E.money(each)}</td>
-        <td class="num"><input type="number" class="it-paid" data-id="${esc(it.id)}" min="0" step="0.01"
+        <td class="num" data-l="Paid ea."><input type="number" class="it-paid" data-id="${esc(it.id)}" min="0" step="0.01"
              placeholder="—" value="${it.paid == null ? '' : it.paid}"
              style="width:80px;text-align:right;padding:4px 6px;font-size:12px"
              title="What you paid, per copy"></td>
-        <td class="num"><b>${each == null ? '—' : E.money(each * qty)}</b></td>
-        <td class="num" style="white-space:nowrap">
+        <td class="num" data-l="Value"><b>${each == null ? '—' : E.money(each * qty)}</b></td>
+        <td class="num acts" data-l="">
           <select class="it-src" data-id="${esc(it.id)}" title="Pulled cards count as winnings in the scoreboard"
                   style="width:auto;display:inline-block;padding:4px 6px;font-size:12px">
             <option value="pull"${it.src !== 'buy' ? ' selected' : ''}>pulled</option>

@@ -173,6 +173,24 @@ nav.tabs button[aria-selected="true"] { background: var(--sea); color: #04121d; 
 .g-4 { grid-template-columns: repeat(4, minmax(0,1fr)); }
 .g-side { grid-template-columns: minmax(0,360px) minmax(0,1fr); align-items: start; }
 
+/* The sidebar is short and the column beside it is tall, so everything below
+   the binder list was dead space — a third of the screen showing nothing while
+   you scrolled a long table next to it. Sticking it to the top puts that area
+   to work: the binders, their values and the trade rate stay in view while you
+   read the cards they contain, which is exactly when you want them.
+
+   Capped to the viewport with its own scroll, so a long binder list can never
+   grow taller than the screen and strand its own bottom. */
+@media (min-width: 861px) {
+  .g-side > :first-child {
+    position: sticky;
+    top: 78px;                       /* clears the sticky header */
+    max-height: calc(100vh - 96px);
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+  }
+}
+
 /* ------------------------------------------------------------------ bits -- */
 .muted { color: var(--ink-3); }
 .small { font-size: 12px; }
@@ -625,6 +643,67 @@ footer.foot { border-top: 1px solid var(--line-soft); margin-top: 40px; padding:
   .fld > span { font-size: 10px; margin-bottom: 4px; }
   label.fld { margin-bottom: 10px; }
   .note { padding: 9px 11px; font-size: 11.5px; }
+
+  /* ---- tables become cards ----------------------------------------------
+     A seven-column table in 412px means dragging sideways to read one row,
+     and losing your place vertically every time you do. Nobody reads a
+     spreadsheet on a phone by panning.
+
+     Each row becomes a card instead: the card name across the top, then one
+     labelled line per value. Everything about one item is visible at once and
+     the only gesture left is scrolling down. Labels come from data-l on each
+     cell, so the header row can be hidden without the numbers losing meaning. */
+  .tbl-scroll { overflow-x: visible; max-height: none; }
+
+  /* These min-widths exist so the DESKTOP table stays readable inside its
+     horizontal scroller. In card mode they do the opposite — they force the
+     table wider than the phone and clip every card at the right edge. */
+  #col-tbl, #sig-tbl, #sets-tbl { min-width: 0; width: 100%; }
+
+  table.tbl { display: block; width: 100%; }
+  table.tbl thead { display: none; }
+  table.tbl tbody { display: block; }
+
+  table.tbl tbody tr {
+    display: block;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--r-s);
+    padding: 10px 12px;
+    margin-bottom: 10px;
+  }
+  table.tbl tbody tr:last-child { margin-bottom: 0; }
+
+  table.tbl tbody td {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 5px 0; border: 0;
+    text-align: right;
+  }
+  /* The label doubles as the row header now that thead is hidden. */
+  table.tbl tbody td[data-l]:not([data-l=""])::before {
+    content: attr(data-l);
+    color: var(--ink-3); font-size: 11px; text-transform: uppercase;
+    letter-spacing: .06em; font-weight: 600;
+    text-align: left; flex: none;
+  }
+  /* First cell is the card itself — full width, no label, reads as a title. */
+  table.tbl tbody td:first-child {
+    justify-content: flex-start; text-align: left;
+    padding: 0 0 8px; margin-bottom: 4px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  /* Controls sit on their own row and get room to breathe. */
+  table.tbl tbody td.acts {
+    justify-content: flex-start; flex-wrap: wrap; gap: 8px;
+    padding-top: 10px; margin-top: 4px;
+    border-top: 1px solid var(--line-soft);
+  }
+  table.tbl tbody td.acts::before { display: none; }
+  /* An empty-state row spans everything and should not look like a card. */
+  table.tbl tbody tr td[colspan] {
+    justify-content: center; border: 0; padding: 14px 0;
+  }
+  table.tbl tbody tr:has(td[colspan]) { background: none; border: 0; }
 
   /* ---- touch targets -----------------------------------------------------
      Measured at 412px: form controls were 38px, in-table links 23px, inline
