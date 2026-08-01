@@ -2356,18 +2356,32 @@
     };
     const fn = fns[S.tab];
     if (!fn) return;
+    const banner = $('#render-error');
     try {
       fn();
+      if (banner) banner.classList.add('hidden');
     } catch (err) {
-      const view = $(`.view[data-view="${S.tab}"]`);
-      if (view) view.innerHTML = `
-        <div class="panel"><div class="panel-b">
-          <h3 style="margin:0 0 8px">This tab failed to render</h3>
-          <p class="small muted">${esc(err && err.message ? err.message : String(err))}</p>
-          <p class="small muted">Your collection is not affected. Refreshing the card data
-             from Settings usually clears it.</p>
-          <button class="btn primary" onclick="location.reload()">Reload</button>
-        </div></div>`;
+      /* NEVER overwrite the view's markup here.
+
+         This used to do `view.innerHTML = '<error panel>'`, which destroyed
+         #rip-set, #rip-grid and every other element wire() had bound a
+         listener to. The tab could then never render again — not after the
+         cause was fixed, not after reloading the data — because the elements
+         it renders INTO no longer existed. A page reload was the only way
+         back, and nothing on screen said so.
+
+         The error goes in a separate banner instead. The view keeps its
+         markup and its listeners, so the next successful render just works. */
+      if (banner) {
+        banner.classList.remove('hidden');
+        banner.innerHTML = `
+          <div class="note warn small">
+            <b>The ${esc(S.tab)} tab could not be drawn.</b>
+            ${esc(err && err.message ? err.message : String(err))}
+            <br><span class="muted">Your collection is not affected. This usually clears once
+            the card data loads — check Settings → Data source.</span>
+          </div>`;
+      }
       if (window.console) console.error('[optcg-quant] render failed:', S.tab, err);
     }
   }
@@ -2496,6 +2510,10 @@
         try { localStorage.removeItem(KEY.cards); } catch (_) {}
         await fetchCards(true);
         invalidate(); renderDataSource(); renderSettings(); renderActive();
+        // The boot banner is stale the moment data arrives.
+        $('#boot-error').classList.add('hidden');
+        const rerr = $('#render-error');
+        if (rerr) rerr.classList.add('hidden');
         msg.innerHTML = `<span class="up">Loaded ${S.cards.length.toLocaleString()} cards ` +
                         `and ${S.products.length} sealed products.</span>`;
       } catch (err) {
@@ -2658,20 +2676,45 @@
     $('#boot-error').classList.add('hidden');
     $('#app').classList.add('hidden');
 
+    /* WIRE FIRST, LOAD SECOND.
+
+       These used to be the other way round, and it produced a dead app that
+       looked alive. With no Worker URL configured the data fetch throws, boot
+       jumped to the catch, and wire() never ran — so no tab ever got a click
+       listener. The tab bar lives in the page header, OUTSIDE #app, so it
+       stayed visible and simply did nothing.
+
+       Worse, it was a trap with no way out: the error told you to open
+       Settings -> Data source, which is precisely the screen you could not
+       reach, because reaching it needed the wiring that never happened.
+
+       Nothing in wire() depends on card data, so there is no reason for it to
+       wait on the network. Wire the UI, then load. If loading fails you get a
+       usable app with an explanation, and you can go and fix the cause. */
+    try {
+      ensureCollections();
+      fillSetPickers();
+      wire();
+      flushOnExit();
+      setSync(S.syncUrl ? 'ok' : 'off', S.syncUrl ? 'connected' : 'Sheets off');
+    } catch (err) {
+      // If even this fails the app is unusable, so say so plainly.
+      $('#boot').classList.add('hidden');
+      $('#boot-error').classList.remove('hidden');
+      $('#boot-error-msg').textContent = 'The app failed to start: ' + (err && err.message || err);
+      return;
+    }
+
     try {
       const r = await fetchCards(false);
       if (r.fromCache) {
         // Cache is warm — show it instantly, then quietly freshen in the background.
         fetchCards(true).then(() => { invalidate(); renderActive(); }).catch(() => {});
       }
-      ensureCollections();
       collapsePermanent('boot');
       runKeyMigration();
       compactTombstones();
-      fillSetPickers();
-      wire();
-      flushOnExit();
-      setSync(S.syncUrl ? 'ok' : 'off', S.syncUrl ? 'connected' : 'Sheets off');
+
       $('#boot').classList.add('hidden');
       $('#app').classList.remove('hidden');
       switchTab('rip');
@@ -2682,12 +2725,13 @@
 
       prewarmIndexes();
     } catch (err) {
+      // Data failed, but the UI is already wired — so land the user ON the
+      // settings tab, where the fix is, instead of on a dead end.
       $('#boot').classList.add('hidden');
+      $('#app').classList.remove('hidden');
       $('#boot-error').classList.remove('hidden');
+      switchTab('settings');
 
-      // The overwhelmingly likely cause on a fresh deploy is no Worker URL:
-      // mockapi/ is a dev snapshot and is not published, so every fetch 404s.
-      // Saying "HTTP 404" there would send you debugging the wrong thing.
       const noSource = SRC.isMock();
       $('#boot-error-msg').innerHTML = noSource
         ? 'No data source is configured.<br><span class="small muted">This app reads ' +
