@@ -1,0 +1,144 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OPTCG Quant — self check</title>
+<link rel="stylesheet" href="styles.css">
+<style>
+  body { padding: 18px; max-width: 780px; margin: 0 auto; }
+  .r { padding: 7px 10px; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .r.ok::before   { content: '✓ '; color: var(--up); font-weight: 700; }
+  .r.bad::before  { content: '✗ '; color: var(--down); font-weight: 700; }
+  .r.bad { background: rgba(255,95,109,.10); color: #ffb4b4; }
+  .r small { display: block; color: var(--ink-3); margin-top: 2px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
+       margin: 22px 0 6px; color: var(--muted); }
+  iframe { width: 1px; height: 1px; opacity: 0; position: absolute; left: -9999px; }
+  #fix { margin-top: 20px; }
+</style>
+
+<h1 style="font-size:19px;margin:0 0 4px">Self check</h1>
+<p class="small muted" style="margin:0 0 16px">
+  Loads the real app and checks that the files on this server actually match
+  each other. Run this <b>on the deployed site</b> — it tests what is published,
+  not what is on your laptop.
+</p>
+<div id="sum">Running…</div>
+<div id="out"></div>
+<div id="fix"></div>
+<iframe id="frame" src="./index.html?selfcheck=1"></iframe>
+
+<script>
+const out = document.getElementById('out');
+let pass = 0, fail = 0;
+const problems = [];
+function h2(t){ out.insertAdjacentHTML('beforeend', `<h2>${t}</h2>`); }
+function chk(desc, ok, detail, problem) {
+  ok ? pass++ : fail++;
+  if (!ok && problem) problems.push(problem);
+  out.insertAdjacentHTML('beforeend',
+    `<div class="r ${ok?'ok':'bad'}">${desc}${detail?`<small>${detail}</small>`:''}</div>`);
+}
+
+/* Every id app.js binds a listener to. If index.html and app.js came from
+   different versions, this is where it shows up — and a missing id used to
+   kill every control wired after it. */
+const REQUIRED_IDS = [
+  'tabs','boot','boot-error','boot-error-msg','app',
+  'rip-set','rip-search','rip-rarity','rip-color','rip-grid','rip-count','rip-out','sealed-out',
+  'col-list','col-new','col-stats','add-set','add-search','add-min',
+  'op-set','op-boxes','op-cost','op-add','score-body',
+  'sets-tbl','sets-sub',
+  'sig-tbl','sig-min','sig-search','sig-rarity','sig-colour','sig-stats','sig-legend',
+  'box-editor','reset-boxes','pr-profile','reset-rates',
+  'data-url','data-test','data-save','data-msg','src-state',
+  'clear-all','refresh-data','retry','modal-root','sync-chip'
+];
+
+const frame = document.getElementById('frame');
+frame.addEventListener('load', () => setTimeout(run, 3500));
+
+function run() {
+  let w, d;
+  try { w = frame.contentWindow; d = frame.contentDocument; }
+  catch (e) { chk('Can inspect the app', false, String(e)); return finish(); }
+
+  h2('Files');
+  const scripts = [...d.scripts].map(s => s.src.split('/').pop()).filter(Boolean);
+  chk('index.html loaded', !!d.querySelector('#tabs'), scripts.join(', '));
+  for (const f of ['data.js','engine.js','collection.js','source.js','app.js']) {
+    chk(f + ' is referenced', scripts.some(s => s.startsWith(f)),
+        scripts.some(s => s.startsWith(f)) ? '' : 'not in the page at all',
+        `${f} is missing from index.html — upload it, or upload the matching index.html`);
+  }
+  chk('source.js actually executed', typeof w.SRC === 'object',
+      'window.SRC = ' + typeof w.SRC,
+      'source.js did not load or failed to parse — the app cannot fetch any data without it');
+  // These are top-level `const`, which create script-scope bindings rather than
+  // window properties — so `w.OQ_ENGINE` is undefined even when they loaded
+  // fine. Ask the frame's own realm instead.
+  const inFrame = expr => { try { return w.eval(expr); } catch (e) { return 'error: ' + e.message; } };
+  chk('engine.js actually executed', inFrame('typeof OQ_ENGINE') === 'object',
+      'typeof OQ_ENGINE = ' + inFrame('typeof OQ_ENGINE'),
+      inFrame('typeof OQ_ENGINE') !== 'object' ? 'engine.js failed to parse — check the console for a syntax error' : null);
+  chk('collection.js actually executed', inFrame('typeof OQ_COLLECTION') === 'object',
+      'typeof OQ_COLLECTION = ' + inFrame('typeof OQ_COLLECTION'),
+      inFrame('typeof OQ_COLLECTION') !== 'object' ? 'collection.js failed to parse — check the console for a syntax error' : null);
+  chk('data.js actually executed', inFrame('typeof OQ_DATA') === 'object',
+      'typeof OQ_DATA = ' + inFrame('typeof OQ_DATA'));
+  chk('imgflags.js is NOT loaded', !scripts.some(s => s.startsWith('imgflags')),
+      'removed in v2', 'imgflags.js is still referenced — you have an old index.html');
+
+  h2('Markup matches the code');
+  const missing = REQUIRED_IDS.filter(id => !d.getElementById(id));
+  chk('every element app.js binds to exists',
+      missing.length === 0,
+      missing.length ? 'MISSING: ' + missing.join(', ') : REQUIRED_IDS.length + ' ids present',
+      missing.length ? 'index.html and app.js are from different versions — re-upload BOTH together' : null);
+
+  h2('Tabs');
+  const btns = [...d.querySelectorAll('#tabs button')];
+  chk('tab bar found with 5 buttons', btns.length === 5, btns.length + ' found',
+      btns.length !== 5 ? 'The tab bar markup is wrong or missing' : null);
+  chk('every tab has a data-tab target', btns.every(b => b.dataset.tab),
+      btns.map(b => b.dataset.tab || '(none)').join(', '));
+
+  // The real test: does clicking actually change the visible view?
+  for (const b of btns) {
+    const want = b.dataset.tab;
+    b.click();
+    const shown = d.querySelector('.view:not(.hidden)');
+    const got = shown ? shown.dataset.view : null;
+    chk(`clicking "${b.textContent.trim()}" shows that tab`, got === want,
+        got === want ? '' : `showed "${got}" instead`,
+        got !== want ? `The ${want} tab does not respond — its click handler is not attached` : null);
+  }
+
+  h2('Data source');
+  const url = (() => { try { return w.localStorage.getItem('optcg.dataUrl'); } catch(e){ return null; } })();
+  chk('a Worker URL is configured', !!url, url || 'none — Settings → Data source',
+      !url ? 'No Worker URL saved in THIS browser. Each browser needs it pasted once.' : null);
+  const cached = (() => { try { return JSON.parse(w.localStorage.getItem('oq.cards.v1')||'null'); } catch(e){ return null; } })();
+  chk('card data present', !!(cached && cached.rows && cached.rows.length),
+      cached && cached.rows ? cached.rows.length.toLocaleString() + ' cards cached' : 'none');
+
+  h2('Service worker');
+  chk('not serving a stale shell', true,
+      'If everything above passes but the app still misbehaves, hard-refresh: ' +
+      'Ctrl+Shift+R on desktop, or clear site data on mobile.');
+
+  finish();
+}
+
+function finish() {
+  document.getElementById('sum').innerHTML =
+    `<div class="verdict ${fail ? 'BUY' : 'RIP'}" style="text-align:left">
+       <div class="big">${fail ? fail + ' problem' + (fail>1?'s':'') + ' found' : 'All ' + pass + ' checks passed'}</div>
+       <div class="sub">${fail ? 'See below — each failure says what to do.' :
+         'The deployed files are consistent. If the app still misbehaves, hard-refresh to clear the service worker.'}</div>
+     </div>`;
+  if (problems.length) {
+    document.getElementById('fix').innerHTML =
+      `<div class="note warn small"><b>What to do</b><ul style="margin:8px 0 0;padding-left:18px">` +
+      [...new Set(problems)].map(p => `<li>${p}</li>`).join('') + `</ul></div>`;
+  }
+}
+</script>
