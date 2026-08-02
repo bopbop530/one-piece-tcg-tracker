@@ -721,24 +721,56 @@
     $('#rip-count').textContent = opts.length
       ? opts.length + (searching ? ' across all sets' : ' cards') : '';
 
-    $('#rip-grid').innerHTML = opts.slice(0, 150).map(e => {
+    /* A listbox, not a pile of divs.
+
+       These were <div class="pick"> with a click handler: no tabindex, no
+       role, no accessible name — the card name lived only in `title`. Picking
+       a card is the whole point of this tab and it was mouse-only, and silent
+       to a screen reader.
+
+       Roving tabindex rather than tabindex="0" on all 150: making every tile a
+       tab stop would put 150 presses between the filters and the rest of the
+       page. One stop enters the grid, arrows move inside it — the standard
+       listbox pattern.
+
+       The aria-label carries everything the tile shows visually plus the name,
+       so the <img> inside stays alt="" on purpose: labelling both would make a
+       screen reader announce the card twice. */
+    const grid = $('#rip-grid');
+    grid.setAttribute('role', 'listbox');
+    grid.setAttribute('aria-label', 'Cards' + (searching ? ' matching your search' : ' in this set'));
+
+    grid.innerHTML = opts.slice(0, 150).map(e => {
       const fl = artFlag(e.card);
+      const selected = e.key === S.ripCard;
+      const from = e.fromSet
+        ? (isBoosterSet(e.fromSet) ? ', pulled from ' + setShort(e.fromSet) + ' packs'
+                                   : ', from ' + setShort(e.fromSet))
+        : '';
+      const label = `${e.card.card_name}${e.variantLabel ? ', ' + e.variantLabel : ''}` +
+                    `, ${e.card.card_set_id}, ${E.money(e.price)}${from}` +
+                    `${fl ? '. ' + artFlagText(fl) : ''}`;
       return `
-      <div class="pick${e.key === S.ripCard ? ' sel' : ''}${fl ? ' badart' : ''}"
+      <div class="pick${selected ? ' sel' : ''}${fl ? ' badart' : ''}"
+           role="option"
+           aria-selected="${selected}"
+           tabindex="${selected ? '0' : '-1'}"
+           aria-label="${esc(label)}"
            data-key="${esc(e.key)}"
-           data-set="${esc(e.fromSet || S.ripSet)}"
-           title="${esc(e.card.card_name)}${e.variantLabel ? ' — ' + esc(e.variantLabel) : ''}${
-             e.fromSet ? (isBoosterSet(e.fromSet)
-                          ? ' — pulled from ' + esc(setShort(e.fromSet)) + ' packs'
-                          : ' — from ' + esc(setShort(e.fromSet))) : ''}${
-             fl ? ' — ' + esc(artFlagText(fl)) : ''}">
+           data-set="${esc(e.fromSet || S.ripSet)}">
         ${cardArt(e.card)}
         <div class="pmeta"><span class="pp">${E.money(e.price)}</span>${rarityChip(e.card)}</div>
         <div class="pn">${searching ? esc(setShort(e.fromSet)) + ' · ' : ''}${esc(e.card.card_set_id)}</div>
       </div>`;
     }).join('') || `<div class="small muted">No cards match.</div>`;
 
-    $$('#rip-grid .pick').forEach(el => el.addEventListener('click', () => {
+    // Nothing selected yet (an empty filter, say) still needs a way in.
+    if (!grid.querySelector('.pick[tabindex="0"]')) {
+      const first = grid.querySelector('.pick');
+      if (first) first.tabIndex = 0;
+    }
+
+    const pickCard = el => {
       if (el.dataset.key === S.ripCard) return;
       // A search hit may live in a different set's pool — follow it there, or
       // the odds lookup would run against the wrong box.
@@ -769,7 +801,52 @@
           }, 350);
         }
       }
-    }));
+    };
+
+    $$('#rip-grid .pick').forEach(el => el.addEventListener('click', () => pickCard(el)));
+
+    /* Keyboard operation of the grid.
+
+       Enter/Space select, arrows move. Arrow keys only move FOCUS and the
+       roving tabindex — they do not select, so arrowing across 150 cards does
+       not re-render the odds panel 150 times. Home/End jump to the ends, which
+       matters when the grid is the whole set. */
+    const gridEl = $('#rip-grid');
+    if (gridEl) gridEl.addEventListener('keydown', ev => {
+      const tile = ev.target.closest('.pick');
+      if (!tile) return;
+
+      if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar') {
+        ev.preventDefault();
+        pickCard(tile);
+        return;
+      }
+
+      const tiles = [...gridEl.querySelectorAll('.pick')];
+      const i = tiles.indexOf(tile);
+      if (i < 0) return;
+
+      // Column count comes from the rendered grid, so Up/Down move a visual
+      // row rather than a guessed one — the grid reflows between phone and
+      // desktop and a hardcoded stride would jump to the wrong card.
+      const cols = Math.max(1, getComputedStyle(gridEl).gridTemplateColumns.split(' ').filter(Boolean).length);
+
+      let next = null;
+      if (ev.key === 'ArrowRight') next = tiles[i + 1];
+      else if (ev.key === 'ArrowLeft') next = tiles[i - 1];
+      else if (ev.key === 'ArrowDown') next = tiles[Math.min(i + cols, tiles.length - 1)];
+      else if (ev.key === 'ArrowUp') next = tiles[Math.max(i - cols, 0)];
+      else if (ev.key === 'Home') next = tiles[0];
+      else if (ev.key === 'End') next = tiles[tiles.length - 1];
+      else return;
+
+      if (!next) return;
+      ev.preventDefault();
+      tile.tabIndex = -1;
+      next.tabIndex = 0;
+      next.focus();
+      next.scrollIntoView({ block: 'nearest' });
+    });
 
     fitGridRows('#rip-grid', 2);
   }
@@ -1212,8 +1289,9 @@
     $('#sets-sub').textContent = rows.length + ' sets · ' + S.cards.length.toLocaleString() + ' cards';
     tbody.innerHTML = rows.map(r => `
       <tr class="clickable" data-set="${esc(r.id)}">
-        <td><b>${esc(r.short)}</b> <span class="muted small">${esc(r.name)}</span>
-          ${r.unverified ? ' <span class="tag est" title="Pack structure is not officially documented — expected value here is a rough read">?</span>' : ''}</td>
+        <td><button type="button" class="rowlink" data-set="${esc(r.id)}">
+          <b>${esc(r.short)}</b> <span class="muted small">${esc(r.name)}</span></button>
+          ${r.unverified ? ' <span class="tag est">? unverified pack structure</span>' : ''}</td>
         <td class="num" data-l="Box price">${E.money(r.box)}${r.est ? ' <span class="tag est">EST</span>' : ''}</td>
         <td class="num" data-l="Case">${r.case_ == null ? '<span class="muted">—</span>' : E.money(r.case_)}</td>
         <td class="num" data-l="EV / box">${E.money(r.evBox)}</td>
@@ -1232,11 +1310,19 @@
         <td class="num muted">${r.cards}</td>
       </tr>`).join('');
 
-    $$('#sets-tbl tbody tr').forEach(tr => tr.addEventListener('click', () => {
-      S.ripSet = tr.dataset.set; S.ripCard = null; S.ripSearch = '';
-      $('#rip-search').value = '';
+    /* The whole row stays clickable for the mouse, but the actionable element
+       is now a real <button> in the first cell — so it is reachable by Tab,
+       activates on Enter/Space for free, and announces as a button with the
+       set name rather than being an invisible click target on a <tr>. */
+    const openSet = setId => {
+      S.ripSet = setId; S.ripCard = null; S.ripSearch = '';
+      const q = $('#rip-search'); if (q) q.value = '';
       switchTab('rip');
-    }));
+    };
+    $$('#sets-tbl tbody .rowlink').forEach(b =>
+      b.addEventListener('click', e => { e.stopPropagation(); openSet(b.dataset.set); }));
+    $$('#sets-tbl tbody tr').forEach(tr =>
+      tr.addEventListener('click', () => openSet(tr.dataset.set)));
   }
 
   /* ============================================================ SIGNALS == */
@@ -1367,10 +1453,12 @@
       const isStale = r.tag && r.tag.code === 'STALE';
       return `<tr class="clickable${isStale ? ' rowstale' : ''}"
                   data-key="${esc(r.entry.key)}" data-set="${esc(r.setId)}">
-        <td><div class="cardcell">
-          <img src="${esc(c.card_image)}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">
-          <div class="nm"><b>${esc(c.card_name)}</b><span>${esc(c.card_set_id)}</span></div>
-        </div></td>
+        <td><button type="button" class="rowlink" data-key="${esc(r.entry.key)}" data-set="${esc(r.setId)}">
+          <span class="cardcell">
+            <img src="${esc(c.card_image)}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">
+            <span class="nm"><b>${esc(c.card_name)}</b><span>${esc(c.card_set_id)}</span></span>
+          </span>
+        </button></td>
         <td data-l="Set"><span class="tag">${esc(setShort(r.setId))}</span></td>
         <td class="num" data-l="Market">${E.money(r.market)}</td>
         <td class="num muted" data-l="Floor">${E.money(r.inv)}</td>
@@ -1378,16 +1466,22 @@
         <td class="num" data-l="Floor / market">${E.pct(r.ratio, 0)}</td>
         <td class="num" data-l="Supply">${isStale ? '<span class="badge-state st-NORMAL">—</span>'
                                   : `<span class="badge-state st-${r.sig.state}">${r.sig.state}</span>`}</td>
-        <td class="num" data-l="Call">${r.tag ? `<span class="call call-${r.tag.code}" title="${esc(r.tag.why)}">${r.tag.label}</span>`
-                                : '<span class="muted">—</span>'}</td>
+        <td class="num why" data-l="Call">${r.tag
+          ? `<span class="call call-${r.tag.code}">${r.tag.label}</span>
+             <span class="whytxt">${esc(r.tag.why)}</span>`
+          : '<span class="muted">—</span>'}</td>
       </tr>`;
     }).join('') || `<tr><td colspan="8" class="muted">Nothing matches those filters.</td></tr>`;
 
-    $$('#sig-tbl tbody tr[data-key]').forEach(tr => tr.addEventListener('click', () => {
-      S.ripSet = tr.dataset.set; S.ripCard = tr.dataset.key; S.ripSearch = '';
-      $('#rip-search').value = '';
+    const openCard = (setId, key) => {
+      S.ripSet = setId; S.ripCard = key; S.ripSearch = '';
+      const q = $('#rip-search'); if (q) q.value = '';
       switchTab('rip');
-    }));
+    };
+    $$('#sig-tbl tbody .rowlink').forEach(b =>
+      b.addEventListener('click', e => { e.stopPropagation(); openCard(b.dataset.set, b.dataset.key); }));
+    $$('#sig-tbl tbody tr[data-key]').forEach(tr =>
+      tr.addEventListener('click', () => openCard(tr.dataset.set, tr.dataset.key)));
   }
 
   /* =========================================================== SETTINGS == */

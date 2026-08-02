@@ -228,6 +228,41 @@ nav.tabs button[aria-selected="true"] { background: var(--sea); color: #04121d; 
 .st-SOFT    { background: #302315; color: #f0b25c; border: 1px solid #6b4c1e; }
 .st-LOOSE   { background: #331717; color: #ff8080; border: 1px solid #6b2a2a; }
 
+/* A real <button> carrying the row's primary action.
+
+   Clickable <tr> elements were mouse-only: no tabindex, no role, no keyboard
+   activation, and nothing for a screen reader to announce. Promoting the first
+   cell's content to a button fixes all of that for free — Tab reaches it,
+   Enter/Space fire it, and it announces with the card or set name.
+
+   Styled to look exactly like the text it replaced, so nothing shifts. */
+.rowlink {
+  background: none; border: 0; padding: 0; margin: 0;
+  font: inherit; color: inherit; text-align: left; cursor: pointer;
+  display: block; width: 100%;
+}
+.rowlink:hover b { color: var(--sea); }
+.rowlink:focus-visible { outline: 2px solid var(--sea); outline-offset: 2px; border-radius: 4px; }
+.rowlink .cardcell { display: flex; align-items: center; gap: 10px; min-width: 0; }
+
+/* Focus ring for the card grid, which is now a listbox. */
+.pick:focus-visible { outline: 2px solid var(--sea); outline-offset: 2px; }
+
+/* The REASON behind a call, as visible text.
+
+   This used to live only in a title= tooltip, which is the single worst place
+   for it: tooltips never appear on touch, so on a phone the entire
+   justification for every call was invisible to everyone, disability or not.
+   Screen readers announce title inconsistently too.
+
+   Shown as real text, clamped so a long sentence cannot stretch the column. */
+td.why { flex-direction: column; align-items: flex-end; gap: 4px; }
+.whytxt {
+  display: block; max-width: 34ch; text-align: right;
+  color: var(--ink-3); font-size: 11px; line-height: 1.45;
+  font-weight: 400; letter-spacing: 0; text-transform: none;
+}
+
 /* ------------------------------------------------------------- controls -- */
 label.fld { display: block; margin-bottom: 13px; }
 label.fld > span {
@@ -704,6 +739,9 @@ footer.foot { border-top: 1px solid var(--line-soft); margin-top: 40px; padding:
     justify-content: center; border: 0; padding: 14px 0;
   }
   table.tbl tbody tr:has(td[colspan]) { background: none; border: 0; }
+
+  td.why { align-items: flex-start; }
+  .whytxt { max-width: none; text-align: left; }
 
   /* ---- touch targets -----------------------------------------------------
      Measured at 412px: form controls were 38px, in-table links 23px, inline
